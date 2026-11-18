@@ -1,0 +1,3 @@
+# @author kongweiguang
+# 商店按原始字节核对各平台的图标，固定换行避免 Windows 检出改变包内图标摘要。
+/resources/icon.svg text eol=lf
