@@ -76,7 +76,8 @@ cargo test --locked
 kerminal-plugin build --platform windows-x86_64
 kerminal-plugin check .kerminal/build --platform windows-x86_64
 kerminal-plugin package --platform windows-x86_64
-kerminal-plugin check .kerminal/packages/kongweiguang.lan-transfer-0.1.0-windows-x86_64.kplugin --platform windows-x86_64
+$version = (Get-Content -LiteralPath 'kerminal-plugin.json' -Raw | ConvertFrom-Json).version
+kerminal-plugin check ".kerminal/packages/kongweiguang.lan-transfer-$version-windows-x86_64.kplugin" --platform windows-x86_64
 kerminal-plugin conformance .kerminal/build/bin/kerminal-plugin-sidecar.exe
 python -I tests/sidecar_http_e2e.py --sidecar .kerminal/build/bin/kerminal-plugin-sidecar.exe
 ```

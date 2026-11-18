@@ -2,14 +2,14 @@
 //! @author kongweiguang
 //!
 //! 这里集中放置身份、上限和内部暂存前缀：清单、协议握手、HTTP 路由和视图必须使用同一组
-//! 值，否则会出现「清单声明 0.1.0、握手报另一个版本」这类只能重启才暴露的错位。
+//! 值，否则会出现「清单版本与握手版本不同」这类只能重启才暴露的错位。
 
 /// 与 `kerminal-plugin.json` 的 id 完全一致；SDK 握手会拒绝任何不一致的自报身份。
 pub const PLUGIN_ID: &str = "kongweiguang.lan-transfer";
-/// 构建脚本通过环境变量注入清单版本；本地 cargo run 回退到清单当前版本。
+/// 发布构建优先取 SDK 注入的清单版本；本地构建沿用 Cargo 包版本，避免第三处硬编码。
 pub const PLUGIN_VERSION: &str = match option_env!("KERMINAL_PLUGIN_VERSION") {
     Some(version) => version,
-    None => "0.1.0",
+    None => env!("CARGO_PKG_VERSION"),
 };
 /// 原生视图键，必须与清单 `views` 的键一致。
 pub const VIEW_ID: &str = "lan.transfer.panel";
