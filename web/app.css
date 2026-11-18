@@ -1,0 +1,770 @@
+/* @author kongweiguang */
+/*
+ * 设计取舍：
+ * 1. 页面由 Sidecar 内嵌，不加载任何外链字体或图标，因此只用系统字体栈；
+ * 2. 颜色全部走 CSS 变量，light/dark 由 prefers-color-scheme 与 data-theme 共同决定，
+ *    这样“自动/浅色/深色”三态可以在不刷新页面的情况下切换；
+ * 3. 布局以内容优先：连接失败、空目录、列表加载都占据稳定的主区域，
+ *    不插入会把内容顶下去的临时占位块；
+ * 4. 手机端把表格压缩成卡片式两行布局，并让操作按钮保持 44px 触控高度。
+ */
+
+:root {
+  --bg: #f4f5f7;
+  --surface: #ffffff;
+  --surface-2: #eef0f3;
+  --border: #dfe3e8;
+  --border-strong: #c8cfd7;
+  --text: #1a1f26;
+  --text-muted: #5f6b78;
+  --text-faint: #8b96a3;
+  --accent: #2f6fed;
+  --accent-strong: #245bd0;
+  --accent-soft: rgba(47, 111, 237, 0.12);
+  --warn-bg: #fff5e0;
+  --warn-border: #f0d49b;
+  --warn-text: #7a5310;
+  --danger: #c0392b;
+  --danger-soft: rgba(192, 57, 43, 0.1);
+  --success: #1f7a4d;
+  --success-soft: rgba(31, 122, 77, 0.12);
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 8px 24px rgba(16, 24, 40, 0.06);
+  --radius: 12px;
+  --radius-sm: 8px;
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI", "PingFang SC", "Noto Sans SC", sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171b;
+    --surface: #1b1f24;
+    --surface-2: #232830;
+    --border: #2e343d;
+    --border-strong: #3c444f;
+    --text: #e8ecf1;
+    --text-muted: #a6b0bc;
+    --text-faint: #7d8794;
+    --accent: #5b93ff;
+    --accent-strong: #7aa8ff;
+    --accent-soft: rgba(91, 147, 255, 0.16);
+    --warn-bg: #2f2716;
+    --warn-border: #5a4a24;
+    --warn-text: #e5c37a;
+    --danger: #f07061;
+    --danger-soft: rgba(240, 112, 97, 0.14);
+    --success: #57c08c;
+    --success-soft: rgba(87, 192, 140, 0.14);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.3);
+  }
+}
+
+/* 手动选择优先于系统偏好；两种深色来源都给出同一组变量。 */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f5f7;
+  --surface: #ffffff;
+  --surface-2: #eef0f3;
+  --border: #dfe3e8;
+  --border-strong: #c8cfd7;
+  --text: #1a1f26;
+  --text-muted: #5f6b78;
+  --text-faint: #8b96a3;
+  --accent: #2f6fed;
+  --accent-strong: #245bd0;
+  --accent-soft: rgba(47, 111, 237, 0.12);
+  --warn-bg: #fff5e0;
+  --warn-border: #f0d49b;
+  --warn-text: #7a5310;
+  --danger: #c0392b;
+  --danger-soft: rgba(192, 57, 43, 0.1);
+  --success: #1f7a4d;
+  --success-soft: rgba(31, 122, 77, 0.12);
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 8px 24px rgba(16, 24, 40, 0.06);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #14171b;
+  --surface: #1b1f24;
+  --surface-2: #232830;
+  --border: #2e343d;
+  --border-strong: #3c444f;
+  --text: #e8ecf1;
+  --text-muted: #a6b0bc;
+  --text-faint: #7d8794;
+  --accent: #5b93ff;
+  --accent-strong: #7aa8ff;
+  --accent-soft: rgba(91, 147, 255, 0.16);
+  --warn-bg: #2f2716;
+  --warn-border: #5a4a24;
+  --warn-text: #e5c37a;
+  --danger: #f07061;
+  --danger-soft: rgba(240, 112, 97, 0.14);
+  --success: #57c08c;
+  --success-soft: rgba(87, 192, 140, 0.14);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+
+* { box-sizing: border-box; }
+
+/* 作者样式里的 display:flex/inline-flex 会覆盖浏览器对 hidden 的默认 display:none，
+ * 这里统一兜底，保证用 hidden 属性控制显隐的组件（提示条、连接按钮、浮层）真的不占位。 */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-text-size-adjust: 100%;
+  text-rendering: optimizeLegibility;
+}
+
+body { padding: 0 0 env(safe-area-inset-bottom); }
+
+button, input { font: inherit; color: inherit; }
+
+.shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  min-height: 100dvh;
+  width: 100%;
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: 0 20px;
+}
+
+/* ---------- 顶栏 ---------- */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 18px 2px 14px;
+}
+
+.brand { display: flex; align-items: center; gap: 9px; min-width: 0; }
+
+.brand-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  flex: none;
+}
+
+.brand-name {
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+.topbar-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; min-width: 0; max-width: 100%; }
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+#session-chip-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+.chip-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  flex: none;
+}
+
+.chip.is-expiring .chip-dot { background: #d39a1f; }
+.chip.is-expired .chip-dot { background: var(--danger); }
+
+/* ---------- 提示条 ---------- */
+
+.notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.notice-warn { background: var(--warn-bg); border: 1px solid var(--warn-border); color: var(--warn-text); }
+
+/* 中文长句和粘贴进来的长路径都必须能在窄屏换行，否则会把整个文档撑出横向滚动。 */
+.notice > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+
+.notice-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+  font-size: 11px;
+  font-weight: 700;
+  flex: none;
+  margin-top: 1px;
+}
+
+/* ---------- 主区 ---------- */
+
+.main { flex: 1 1 auto; padding-bottom: 28px; }
+
+/* ---------- 连接卡片 ---------- */
+
+.connect {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 52vh;
+  padding: 24px 0;
+}
+
+.connect-card {
+  width: 100%;
+  max-width: 460px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 34px 30px 30px;
+  text-align: center;
+}
+
+.connect-title { margin: 0 0 10px; font-size: 19px; font-weight: 650; }
+
+.connect-body {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.connect-actions { margin-top: 20px; display: flex; justify-content: center; gap: 10px; }
+
+.connect-spinner {
+  width: 26px;
+  height: 26px;
+  margin: 0 auto 18px;
+  border-radius: 50%;
+  border: 2.5px solid var(--border-strong);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- 共享目录头 ---------- */
+
+.banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 14px;
+  margin-bottom: 16px;
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
+}
+
+.banner-warn { background: var(--warn-bg); border: 1px solid var(--warn-border); color: var(--warn-text); }
+.banner-error { background: var(--danger-soft); border: 1px solid var(--danger); color: var(--danger); }
+.banner-text { min-width: 0; overflow-wrap: anywhere; }
+
+.share-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 6px; }
+
+.share-head-main { min-width: 0; }
+
+.share-title {
+  margin: 0;
+  font-size: 21px;
+  font-weight: 660;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+
+.share-sub { margin: 4px 0 0; color: var(--text-muted); font-size: 13px; line-height: 1.5; }
+
+/* ---------- 面包屑 ---------- */
+
+.crumbs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin: 16px 0 14px;
+  padding: 7px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
+  min-height: 40px;
+}
+
+/* 行首“当前位置”标签：把只有文件夹名的整条栏与输入框区分开。
+ * 用次要色小字，不抢文件夹名的可点击感；窄屏允许收缩换行，不挤压路径本身。 */
+.crumbs-label {
+  color: var(--text-faint);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  margin-right: 4px;
+  white-space: nowrap;
+  flex: none;
+}
+
+.crumbs-label::after { content: ':'; }
+
+.crumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: 100%;
+}
+
+.crumb button {
+  border: 0;
+  background: transparent;
+  padding: 3px 6px;
+  border-radius: 6px;
+  color: var(--accent);
+  cursor: pointer;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.crumb button:hover { background: var(--accent-soft); }
+.crumb button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.crumb button[aria-current="page"] { color: var(--text); font-weight: 600; cursor: default; }
+.crumb button[aria-current="page"]:hover { background: transparent; }
+
+.crumb-sep { color: var(--text-faint); user-select: none; padding: 0 1px; }
+
+/* ---------- 工具条 ---------- */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.toolbar-main { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.toolbar-hint { color: var(--text-faint); font-size: 12.5px; }
+.toolbar-meta { color: var(--text-muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+
+/* ---------- 按钮 ---------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 0 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 560;
+  cursor: pointer;
+  transition: background-color 0.14s ease, border-color 0.14s ease, opacity 0.14s ease;
+  white-space: nowrap;
+}
+
+.btn:hover { background: var(--border); }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn:disabled { opacity: 0.45; cursor: default; }
+
+.btn-primary { background: var(--accent); color: #fff; }
+.btn-primary:hover { background: var(--accent-strong); }
+
+.btn-ghost { background: transparent; border-color: var(--border); color: var(--text-muted); }
+.btn-ghost:hover { background: var(--surface-2); color: var(--text); }
+
+.btn-small { min-height: 28px; padding: 0 10px; font-size: 12.5px; }
+
+.btn-link {
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 4px 2px;
+  font-size: 13.5px;
+  border-radius: 6px;
+}
+.btn-link:hover { text-decoration: underline; }
+.btn-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn-link[disabled] { color: var(--text-faint); cursor: default; text-decoration: none; }
+
+/* ---------- 上传区 ---------- */
+
+.uploads {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px 6px;
+  margin-bottom: 14px;
+}
+
+.uploads-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.uploads-title { font-size: 13px; font-weight: 620; color: var(--text-muted); }
+.uploads-actions { display: flex; gap: 6px; }
+
+.upload-list { list-style: none; margin: 0; padding: 0; }
+
+.upload-item {
+  padding: 9px 0;
+  border-top: 1px solid var(--border);
+}
+
+.upload-item:first-child { border-top: 0; }
+
+.upload-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.upload-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13.5px;
+}
+
+.upload-state { color: var(--text-muted); font-size: 12.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.upload-state.is-done { color: var(--success); }
+.upload-state.is-error { color: var(--danger); }
+.upload-state.is-cancelled { color: var(--text-faint); }
+/* 结果待核对：既不能着绿色也不能着红色，用警示色表达“可能已提交、需要确认”。 */
+.upload-state.is-uncertain { color: var(--warn-text); }
+
+.upload-bar {
+  height: 4px;
+  margin-top: 6px;
+  border-radius: 2px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.upload-bar-fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.12s linear;
+}
+
+.upload-item.is-done .upload-bar-fill { background: var(--success); }
+.upload-item.is-error .upload-bar-fill { background: var(--danger); }
+/* 取消后进度条改灰，避免看起来像仍在传输或已成功。 */
+.upload-item.is-cancelled .upload-bar-fill { background: var(--text-faint); }
+.upload-item.is-uncertain .upload-bar-fill { background: var(--warn-text); }
+
+/* 结果未确认时进度条不再是一条实心满条（实心满条会被读成“100% 已成功”）：
+ * 改成琥珀色斜纹的不确定外观，配合状态文字与 aria-valuetext 表达“结果未知”。
+ * 传输中的真实进度仍用实心条，最终成功才用绿色满条。 */
+.upload-item.is-uncertain-bar .upload-bar {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--surface-2) 0 6px,
+    rgba(0, 0, 0, 0.06) 6px 12px
+  );
+}
+.upload-item.is-uncertain-bar .upload-bar-fill {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--warn-text) 0 6px,
+    transparent 6px 12px
+  );
+  opacity: 0.55;
+}
+
+.upload-actions { display: flex; align-items: center; gap: 4px; }
+
+/* ---------- 文件列表 ---------- */
+
+.list-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.list-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 16px;
+  border-bottom: 1px solid var(--border);
+  min-height: 44px;
+}
+
+.list-count { font-size: 12.5px; color: var(--text-faint); white-space: nowrap; }
+
+/* 状态行只保留单行：下载反馈等长文案用省略号收尾，完整内容放在 title，
+ * 否则窄屏上会把整条列表头顶高，造成内容上下跳动。 */
+.list-status {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.list-status.is-error { color: var(--danger); }
+
+.files { width: 100%; border-collapse: collapse; table-layout: fixed; }
+
+/* 文件名可能是无空格的长串；table-layout:fixed 配合 min-width:0 才能让省略号生效。 */
+.col-name { min-width: 0; }
+
+.files th {
+  text-align: left;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  padding: 9px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.files th.col-size, .files td.col-size,
+.files th.col-modified, .files td.col-modified { width: 120px; }
+.files th.col-action, .files td.col-action { width: 84px; text-align: right; }
+.files th.col-size, .files td.col-size { text-align: right; }
+
+.files td {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13.5px;
+  vertical-align: middle;
+}
+
+.files tbody tr:last-child td { border-bottom: 0; }
+.files tbody tr:hover { background: var(--surface-2); }
+
+.entry-name { display: flex; align-items: center; gap: 9px; min-width: 0; }
+
+.entry-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  flex: none;
+}
+
+.entry-icon.is-dir { background: var(--accent-soft); color: var(--accent); }
+
+.entry-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 0;
+  background: transparent;
+  padding: 3px 2px;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.entry-label.is-dir { color: var(--accent); font-weight: 560; }
+.entry-label:hover { text-decoration: underline; }
+.entry-label:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.entry-label[disabled] { cursor: default; text-decoration: none; }
+
+.col-size, .col-modified { color: var(--text-muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.col-modified { white-space: nowrap; }
+
+.list-empty {
+  padding: 44px 20px;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 13.5px;
+  overflow-wrap: anywhere;
+}
+
+/* 空状态显示的是错误时用危险色，和真正的“目录为空”区分开。 */
+.list-empty.is-error { color: var(--danger); }
+
+.list-foot { display: flex; justify-content: center; padding: 12px; border-top: 1px solid var(--border); }
+
+/* ---------- 拖放遮罩 ---------- */
+
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 14, 20, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.drop-card {
+  padding: 26px 34px;
+  border-radius: var(--radius);
+  border: 2px dashed var(--accent);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+  box-shadow: var(--shadow);
+}
+
+/* ---------- 页脚 ---------- */
+
+.foot {
+  padding: 16px 2px 22px;
+  border-top: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: 12px;
+  text-align: center;
+}
+
+.noscript {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--bg);
+  color: var(--text);
+  text-align: center;
+}
+
+/* ---------- 手机 ---------- */
+
+@media (max-width: 720px) {
+  .shell { padding: 0 14px; }
+  .topbar { padding: 14px 0 10px; }
+  .brand-name { font-size: 14px; }
+  .share-title { font-size: 18px; }
+  .connect-card { padding: 28px 20px 24px; }
+
+  /* 触屏上按钮高度统一到 44px，避免下载/打开这类行内操作需要精确点按。 */
+  .btn { min-height: 44px; padding: 0 16px; }
+  .btn-small { min-height: 34px; padding: 0 12px; }
+  /* 触屏上行内操作（下载/取消/查看目录/移除等文本链接）统一到 44×44 最小热区：
+   * 视觉仍是文本链接（无背景边框），但命中范围不再小于指腹；
+   * 44px 最小宽度保证“移除”这类双字按钮也够点。 */
+  .btn-link { min-height: 44px; min-width: 44px; padding: 10px 8px; display: inline-flex; align-items: center; justify-content: center; }
+  .crumb button { min-height: 44px; }
+
+  .files thead { display: none; }
+
+  .files, .files tbody, .files tr, .files td { display: block; width: 100%; }
+
+  .files tr {
+    position: relative;
+    padding: 12px 16px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .files tbody tr:last-child { border-bottom: 0; }
+
+  .files td { padding: 0; border: 0; }
+
+  .files td.col-size, .files td.col-modified { display: inline-block; width: auto; font-size: 12px; }
+  .files td.col-modified::before { content: "·"; color: var(--text-faint); margin: 0 6px 0 2px; }
+
+  /* 手机上表格行改成块级后不再受 table-layout 约束，这里限制名称宽度保证省略号生效。 */
+  .files td.col-name { width: 100%; }
+  .entry-label { max-width: 100%; }
+  .entry-name { min-width: 0; }
+
+  .files td.col-action {
+    position: absolute;
+    right: 12px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: auto;
+    text-align: right;
+  }
+
+  /* 目录行没有大小/时间语义，手机上直接不显示这两格，避免出现 “— · —” 这种占位噪音。 */
+  .files tr.is-dir-row .col-size,
+  .files tr.is-dir-row .col-modified { display: none; }
+
+  /* 目录行只有名称和操作，没有大小/时间行；操作按钮垂直居中即可，避免出现空行。 */
+  .files tr.is-dir-row { padding-top: 8px; padding-bottom: 8px; }
+
+  /* 上传行的“无法确认结果，请查看目标目录”在窄屏比旧文案长；状态文本允许换行、
+   * 操作组允许整体换到下一行，避免把文件名挤到不可读或撑出横向滚动。 */
+  .upload-row { flex-wrap: wrap; }
+  .upload-state { white-space: normal; text-align: right; min-width: 0; }
+
+  .files td.col-name { padding-right: 84px; }
+  .files td.col-name + td.col-size { margin-top: 4px; }
+
+  .entry-name { min-height: 30px; }
+
+  .toolbar-hint { display: none; }
+  .crumb button { max-width: 150px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

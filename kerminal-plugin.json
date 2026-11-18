@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "id": "kongweiguang.lan-transfer",
+  "name": {
+    "zh-CN": "局域网文件传输",
+    "en": "LAN File Transfer"
+  },
+  "description": {
+    "zh-CN": "在本机选择共享目录，用浏览器在同一局域网内浏览、上传与下载文件。HTTP 明文传输，请只在可信网络使用。",
+    "en": "Share one local folder over your LAN and browse, upload, or download from a browser. Plain HTTP only; use it on trusted networks."
+  },
+  "version": "0.1.0",
+  "api": ">=1.1.0 <2.0.0",
+  "publisher": "kongweiguang",
+  "license": "GPL-3.0-or-later",
+  "repository": "https://github.com/kongweiguang/kerminal-plugin-lan-transfer",
+  "categories": [
+    "network"
+  ],
+  "icon": "icon.svg",
+  "runtime": {
+    "kind": "sidecar",
+    "main": {
+      "windows-x86_64": "bin/kerminal-plugin-sidecar.exe",
+      "linux-x86_64": "bin/kerminal-plugin-sidecar",
+      "macos-x86_64": "bin/kerminal-plugin-sidecar",
+      "macos-aarch64": "bin/kerminal-plugin-sidecar"
+    },
+    "activation": "on-demand"
+  },
+  "permissions": [
+    "full-access",
+    "clipboard.write"
+  ],
+  "contributes": {
+    "tools": [
+      {
+        "id": "lan-transfer.panel",
+        "title": "%tool.title%",
+        "view": "lan.transfer.panel",
+        "scope": "window",
+        "icon": "icon.svg"
+      }
+    ]
+  },
+  "views": {
+    "lan.transfer.panel": {
+      "kind": "native",
+      "file": "views/panel.json"
+    }
+  },
+  "l10n": "l10n"
+}

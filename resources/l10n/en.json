@@ -1,0 +1,16 @@
+{
+  "tool.title": "LAN File Transfer",
+  "notice.share": "Anyone with the link can browse and upload to this folder. Treat the link as a password.",
+  "section.folder": "Shared folder",
+  "field.folder": "Folder",
+  "section.address": "Listen address",
+  "field.address": "Address",
+  "placeholder.address": "192.168.1.10",
+  "notice.address": "Only addresses of this computer are accepted; the port is assigned by the system.",
+  "section.running": "Sharing",
+  "action.start": "Start",
+  "action.stop": "Stop",
+  "action.copy": "Copy link",
+  "qrcode.label": "Scan to open",
+  "notice.plaintext": "Plain HTTP: people on the same network may read file contents and session data. Use it only on a trusted network."
+}

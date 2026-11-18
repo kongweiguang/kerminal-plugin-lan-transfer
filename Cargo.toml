@@ -1,0 +1,76 @@
+# @author kongweiguang
+[package]
+name = "kerminal-plugin-lan-transfer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "GPL-3.0-or-later"
+publish = false
+
+[[bin]]
+# 宿主构建脚本按这个固定名字查找产物，改名会让 build/package 找不到 Sidecar。
+name = "kerminal-plugin-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+# 与官方模板一致，固定检出到 .kerminal-sdk/ 的 SDK 副本；发布工作流把同一路径检出为
+# 指定的 40 位提交，避免开发机工作树与 CI 使用的 SDK 版本漂移。
+kerminal-plugin-sdk = { path = ".kerminal-sdk/sdk/rust" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net"] }
+tokio-util = { version = "0.7", features = ["io"] }
+# 上传请求体按流消费需要 StreamExt；不引入整套 futures，只取最小工具 crate。
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+axum = "0.8"
+base64 = "0.22"
+getrandom = "0.3"
+# 令牌摘要用 SHA-256 即可：服务端只在内存里按摘要查表，不需要口令派生或密钥派生。
+sha2 = "0.10"
+subtle = "2"
+if-addrs = "0.13"
+qrcode = { version = "0.14.1", default-features = false }
+sys-locale = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+# 句柄相对的目录操作需要 NT API 与重解析点标志，std 没有对应封装。
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# openat / renameat_with / fstatat 是逐段 no-follow 与原子不覆盖提交的唯一稳定入口。
+rustix = { version = "1.1", features = ["fs", "stdio"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+# 后端回归放在 tests/backend/，需显式声明才能作为集成测试目标运行。
+[[test]]
+name = "http_contract"
+path = "tests/backend/http_contract.rs"
+
+[[test]]
+name = "view_data"
+path = "tests/backend/view_data.rs"
+
+[[test]]
+name = "rpc_handshake"
+path = "tests/backend/rpc_handshake.rs"
+
+# 插件独立构建，不隐式加入放置目录外层的工作区。
+#
+# 必须显式排除 `.kerminal-sdk`：它是主仓的检出（开发机是 junction，CI 是真实目录），
+# 自带 `[workspace]` 与 `workspace.package`/`workspace.dependencies`。不排除时 Cargo
+# 会把插件清单当作它的外层工作区根，于是 `sdk/rust/Cargo.toml` 里的
+# `edition.workspace = true` 去继承插件的空 `[workspace]`，解析阶段直接失败。
+# 排除后 SDK 仍按自身清单解析（继承它自己的 workspace 字段），插件工作区只含本包。
+[workspace]
+exclude = [".kerminal-sdk"]

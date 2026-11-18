@@ -1,0 +1,168 @@
+{
+  "schema": 1,
+  "data": {
+    "root_path": "",
+    "selected_address": "",
+    "addresses": [],
+    "addresses_hint": "127.0.0.1 is local only",
+    "phase": "idle",
+    "running": false,
+    "starting": false,
+    "stopping": false,
+    "failed": false,
+    "address": null,
+    "link": null,
+    "root_name": null,
+    "qr": null,
+    "status": "",
+    "error": null,
+    "uploaded": 0,
+    "downloaded": 0,
+    "stats": ""
+  },
+  "root": {
+    "type": "scroll",
+    "child": {
+      "type": "stack",
+      "gap": "md",
+      "children": [
+        {
+          "type": "notice",
+          "text": "%notice.share%",
+          "tone": "warning"
+        },
+        {
+          "type": "section",
+          "title": "%section.folder%",
+          "gap": "sm",
+          "children": [
+            {
+              "type": "path",
+              "bind": "root_path",
+              "label": "%field.folder%",
+              "mode": "directory"
+            },
+            {
+              "type": "text",
+              "text": "$root_name",
+              "tone": "muted",
+              "visible": "$running"
+            }
+          ]
+        },
+        {
+          "type": "section",
+          "title": "%section.address%",
+          "gap": "sm",
+          "children": [
+            {
+              "type": "input",
+              "bind": "selected_address",
+              "label": "%field.address%",
+              "placeholder": "%placeholder.address%",
+              "on_submit": "set-address"
+            },
+            {
+              "type": "text",
+              "text": "$addresses_hint",
+              "tone": "muted"
+            },
+            {
+              "type": "text",
+              "text": "%notice.address%",
+              "tone": "muted"
+            }
+          ]
+        },
+        {
+          "type": "toolbar",
+          "gap": "sm",
+          "children": [
+            {
+              "type": "button",
+              "action": "start",
+              "label": "%action.start%",
+              "icon": "play",
+              "variant": "primary",
+              "busy": "$starting"
+            },
+            {
+              "type": "button",
+              "action": "stop",
+              "label": "%action.stop%",
+              "icon": "circle-stop",
+              "variant": "danger",
+              "busy": "$stopping"
+            }
+          ]
+        },
+        {
+          "type": "section",
+          "title": "%section.running%",
+          "gap": "sm",
+          "children": [
+            {
+              "type": "row",
+              "gap": "sm",
+              "children": [
+                {
+                  "type": "badge",
+                  "text": "$status",
+                  "tone": "default"
+                },
+                {
+                  "type": "text",
+                  "text": "$address",
+                  "tone": "muted"
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "text": "$link",
+              "tone": "muted",
+              "visible": "$running"
+            },
+            {
+              "type": "qrcode",
+              "matrix": "$qr",
+              "label": "%qrcode.label%",
+              "visible": "$running"
+            },
+            {
+              "type": "row",
+              "gap": "sm",
+              "visible": "$running",
+              "children": [
+                {
+                  "type": "button",
+                  "action": "copy-link",
+                  "label": "%action.copy%",
+                  "icon": "copy",
+                  "variant": "secondary"
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "text": "$stats",
+              "tone": "muted",
+              "visible": "$running"
+            },
+            {
+              "type": "notice",
+              "text": "%notice.plaintext%",
+              "tone": "warning"
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "text": "$error",
+          "tone": "danger",
+          "visible": "$failed"
+        }
+      ]
+    }
+  }
+}

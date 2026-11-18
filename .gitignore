@@ -1,0 +1,6 @@
+# @author kongweiguang
+# CLI 构建产物、依赖目录与本地检出的 SDK 都不属于插件源码。
+.kerminal/
+.kerminal-sdk/
+target/
+node_modules/

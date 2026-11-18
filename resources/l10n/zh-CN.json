@@ -1,0 +1,16 @@
+{
+  "tool.title": "局域网文件传输",
+  "notice.share": "持有链接的人可以浏览并上传到此目录；链接视同密码，请勿转发给不可信的人。",
+  "section.folder": "共享目录",
+  "field.folder": "目录",
+  "section.address": "监听地址",
+  "field.address": "地址",
+  "placeholder.address": "192.168.1.10",
+  "notice.address": "只接受本机地址；端口由系统自动分配。",
+  "section.running": "共享状态",
+  "action.start": "启动服务",
+  "action.stop": "停止服务",
+  "action.copy": "复制链接",
+  "qrcode.label": "扫码打开",
+  "notice.plaintext": "HTTP 明文传输：同一网络中的人可能看到文件内容与会话信息，请只在可信网络使用。"
+}

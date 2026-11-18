@@ -1,0 +1,141 @@
+<!doctype html>
+<!-- @author kongweiguang -->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <!-- 页面没有任何第三方资源；CSP 额外把脚本、连接和框架都限制在同源，票据 URL 也走同源。 -->
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'none'">
+  <title>LAN Transfer · 局域网文件传输</title>
+  <link rel="icon" href="data:,">
+  <style>
+    /* 放在 app.css 之前，只作为样式表尚未生效时的底色兜底；
+       放在后面会覆盖 data-theme 手动主题，因此顺序不能颠倒。 */
+    html { background: #f4f5f7; color: #1a1f26; }
+    @media (prefers-color-scheme: dark) { html { background: #14171b; color: #e8ecf1; } }
+  </style>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="16" height="16" focusable="false">
+            <path fill="currentColor" d="M4 7.5h11.2l-2.6-2.6L14 3.5 19 8.5 14 13.5l-1.4-1.4 2.6-2.6H4v-2Zm16 9H8.8l2.6 2.6L10 20.5 5 15.5l5-5 1.4 1.4-2.6 2.6H20v2Z"/>
+          </svg>
+        </span>
+        <span class="brand-name">LAN Transfer</span>
+      </div>
+      <div class="topbar-actions">
+        <span class="chip" id="session-chip" hidden>
+          <span class="chip-dot" aria-hidden="true"></span>
+          <span id="session-chip-text"></span>
+        </span>
+        <button class="btn btn-ghost btn-small" id="lang-btn" type="button" title="切换语言">EN</button>
+        <button class="btn btn-ghost btn-small" id="theme-btn" type="button" title="主题">自动</button>
+        <button class="btn btn-ghost btn-small" id="disconnect-btn" type="button" hidden>断开</button>
+      </div>
+    </header>
+
+    <div class="notice notice-warn" id="plaintext-notice" role="note">
+      <span class="notice-icon" aria-hidden="true">!</span>
+      <span id="plaintext-text">HTTP 明文传输：同一网络中的人可能看到文件内容与会话信息，请只在可信网络使用。</span>
+    </div>
+
+    <main class="main">
+      <!-- 同页换 fragment 不会重载页面；新链接被保留还是忽略都用这条提示说明，
+           放在两个视图之外，保证连接页与浏览页都能看到。 -->
+      <div class="banner banner-warn" id="link-notice" hidden role="status">
+        <span class="banner-text" id="link-notice-text"></span>
+        <button class="btn btn-ghost btn-small" id="link-notice-dismiss" type="button">知道了</button>
+      </div>
+
+      <section class="connect" id="connect-view" aria-live="polite">
+        <div class="connect-card">
+          <div class="connect-spinner" id="connect-spinner" hidden aria-hidden="true"></div>
+          <h1 class="connect-title" id="connect-title">连接共享目录</h1>
+          <p class="connect-body" id="connect-body">请在 Kerminal 中复制分享链接，并在浏览器中重新打开。</p>
+          <div class="connect-actions">
+            <button class="btn btn-primary" id="connect-retry" type="button" hidden>重试</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="browse" id="browse-view" hidden>
+        <div class="banner banner-warn" id="browse-banner" hidden role="alert">
+          <span class="banner-text" id="browse-banner-text"></span>
+          <button class="btn btn-ghost btn-small" id="browse-banner-action" type="button" hidden>重试连接</button>
+        </div>
+
+        <div class="share-head">
+          <div class="share-head-main">
+            <h1 class="share-title" id="share-title">共享目录</h1>
+            <p class="share-sub" id="share-sub">持有链接者可浏览并上传到此目录；链接视同密码，请勿转发给不可信的人。</p>
+          </div>
+        </div>
+
+        <nav class="crumbs" id="breadcrumbs" aria-label="路径"></nav>
+
+        <div class="toolbar">
+          <div class="toolbar-main">
+            <button class="btn btn-primary" id="upload-btn" type="button">选择文件</button>
+            <input type="file" id="file-input" multiple hidden>
+            <span class="toolbar-hint" id="upload-hint">也可以把文件拖到此页面</span>
+          </div>
+          <div class="toolbar-meta" id="upload-summary" hidden></div>
+        </div>
+
+        <section class="uploads" id="uploads" hidden aria-label="上传">
+          <div class="uploads-head">
+            <span class="uploads-title" id="uploads-title">上传</span>
+            <div class="uploads-actions">
+              <button class="btn btn-ghost btn-small" id="cancel-all" type="button" hidden>全部取消</button>
+              <button class="btn btn-ghost btn-small" id="clear-done" type="button" hidden>清除已完成</button>
+            </div>
+          </div>
+          <ul class="upload-list" id="upload-list"></ul>
+        </section>
+
+        <div class="list-card" id="list-card">
+          <div class="list-head" id="list-head">
+            <span class="list-count" id="list-count"></span>
+            <span class="list-status" id="list-status" role="status" aria-live="polite"></span>
+            <button class="btn btn-ghost btn-small" id="list-retry" type="button" hidden>重试</button>
+          </div>
+          <table class="files">
+            <thead>
+              <tr>
+                <th scope="col" data-i18n="colName">名称</th>
+                <th scope="col" class="col-size" data-i18n="colSize">大小</th>
+                <th scope="col" class="col-modified" data-i18n="colModified">修改时间</th>
+                <th scope="col" class="col-action" data-i18n="colAction">操作</th>
+              </tr>
+            </thead>
+            <tbody id="entries"></tbody>
+          </table>
+          <div class="list-foot" id="list-foot" hidden>
+            <button class="btn btn-ghost" id="load-more" type="button" data-i18n="loadMore">加载更多</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <span data-i18n="footNote">HTTP 明文传输，不提供加密；下载是否完成由浏览器决定。</span>
+    </footer>
+  </div>
+
+  <div class="drop-overlay" id="drop-overlay" hidden>
+    <div class="drop-card" data-i18n="dropHere">松开以上传到当前目录</div>
+  </div>
+
+  <noscript>
+    <div class="noscript">此页面需要启用 JavaScript。/ This page requires JavaScript.</div>
+  </noscript>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>
