@@ -7,12 +7,9 @@
 # sdk/cli、sdk/protocol 与 sdk/rust 的完整 40 位提交 SHA。可选变量 KERMINAL_SDK_REPOSITORY（默认
 # kongweiguang/Kerminal）、KERMINAL_PLUGIN_OFFICIAL（官方保留 ID 使用 true）；私有 SDK
 # 仓库可配置 Secret KERMINAL_SDK_TOKEN。
-# macOS 签名 Secret：APPLE_CERTIFICATE_BASE64、APPLE_CERTIFICATE_PASSWORD、APPLE_SIGNING_IDENTITY。
-# 公证另需 Secret：APPLE_ID、APPLE_TEAM_ID、APPLE_APP_SPECIFIC_PASSWORD。
-# 本工作流由任意 v* tag 触发，包括预发布版本；这些 tag 的 macOS Sidecar 同样必须完成
-# 签名与公证：六个 Secret 缺少任何一个都直接失败，不产生未签名或未公证的插件包。
-# 目前没有为预发布提供跳过门禁的路径；若将来需要，必须先显式增加独立开关。
-# 本工作流只建立门禁，不声称 Gatekeeper 验收已通过。
+# 任意 v* tag（含正式和预发布）的 macOS Sidecar 仅做本地 ad-hoc 签名和严格校验，
+# 以保留 Mach-O 签名完整性与 Apple Silicon 的执行兼容性，不依赖 Developer ID 或 Apple 公证。
+# 不修改 Gatekeeper 策略；runner 上验证通过不代表下载后能通过 Gatekeeper。
 # 依赖锁定门禁：SDK CLI 的 cargo build 不带 --locked（sdk/cli/src/build.rs），因此本仓库
 # 在真实构建前用 `cargo fetch --locked` 验证已提交的 Cargo.lock 与所检出的 SDK 依赖一致，
 # 构建后再次确认 Cargo.lock 相对检出无任何变化，任何不一致都不能进入打包与发布。
@@ -202,30 +199,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & kerminal-plugin check .kerminal/build --platform $env:PLUGIN_PLATFORM @policy
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $manifest = Get-Content -LiteralPath 'kerminal-plugin.json' -Raw | ConvertFrom-Json
-          if ($manifest.runtime.kind -eq 'sidecar') {
-            # 每个平台执行其真实二进制；常规一致性检查不声称验证 fixture 专用的取消和背压探针。
-            $main = $manifest.runtime.main.($env:PLUGIN_PLATFORM)
-            $executable = Join-Path (Join-Path $PWD '.kerminal/build') $main
-            & kerminal-plugin conformance $executable
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
           # 构建后逐字节比对 Cargo.lock：fetch --locked 只证明构建前的锁文件有效，
           # 无法覆盖构建期间所有写锁文件的路径，实际未发生改写必须用终态确认。
           if ((Get-FileHash -Algorithm SHA256 'Cargo.lock').Hash -ne
               (Get-FileHash -Algorithm SHA256 (Join-Path $env:RUNNER_TEMP 'Cargo.lock.checked-out')).Hash) {
             throw '构建期间 Cargo.lock 发生变化；SDK cargo build 未锁定依赖，禁止发布。'
           }
-      - name: Sign and notarize macOS Sidecar when configured
+      - name: Ad-hoc sign and verify macOS Sidecar
         if: runner.os == 'macOS' && matrix.platform != 'any'
         shell: bash
-        env:
-          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
           set -euo pipefail
           binary="$(python3 - <<'PY'
@@ -238,50 +220,20 @@ jobs:
           PY
           )"
           test -f "$binary"
-          # 本工作流由任意 v* tag（含预发布）触发，这些 tag 的 macOS Sidecar 都必须签名且
-          # 公证：任何 Secret 缺失都 fail closed，不再降级为 warning 后继续，避免未签名/
-          # 未公证的包流入 Release。Secret 值不打印、不落日志，这里只检查非空。
-          if [[ -z "${APPLE_CERTIFICATE_BASE64:-}" || -z "${APPLE_CERTIFICATE_PASSWORD:-}" || -z "${APPLE_SIGNING_IDENTITY:-}" \
-                || -z "${APPLE_ID:-}" || -z "${APPLE_TEAM_ID:-}" || -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
-            missing=()
-            # 六个 Secret 都由 step 的 env 块注入（可能为空串），用间接展开按名收集缺失项；
-            # 间接展开不支持 ${var:-} 形式，用 if 语句避免 set -e 在最后一项空值时中断。
-            for secret in APPLE_CERTIFICATE_BASE64 APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_TEAM_ID APPLE_APP_SPECIFIC_PASSWORD; do
-              if [[ -z "${!secret}" ]]; then
-                missing+=("$secret")
-              fi
-            done
-            echo "::error::macOS Sidecar 必须完成代码签名与公证；缺少 Secret：${missing[*]}。"
-            exit 1
-          fi
-          signing_dir="$(mktemp -d "${RUNNER_TEMP}/kerminal-sign.XXXXXXXX")"
-          keychain="${signing_dir}/signing.keychain-db"
-          # 临时钥匙串及证书即使在签名或公证失败时也会清除。
-          cleanup() {
-            security delete-keychain "$keychain" >/dev/null 2>&1 || true
-            rm -rf "$signing_dir"
-          }
-          trap cleanup EXIT
-          keychain_password="$(openssl rand -hex 32)"
-          echo "::add-mask::${keychain_password}"
-          printf '%s' "$APPLE_CERTIFICATE_BASE64" | base64 -D > "${signing_dir}/certificate.p12"
-          security create-keychain -p "$keychain_password" "$keychain"
-          security unlock-keychain -p "$keychain_password" "$keychain"
-          security import "${signing_dir}/certificate.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain"
-          codesign --force --options runtime --timestamp --keychain "$keychain" --sign "$APPLE_SIGNING_IDENTITY" "$binary"
+          # 本地签名保留 Mach-O 代码完整性，不声称证明发布者身份或通过 Gatekeeper。
+          codesign --force --sign - "$binary"
           codesign --verify --strict --verbose=2 "$binary"
-          # notarytool 接受包含已签名独立可执行文件的 ZIP；提交结束后再生成 kplugin。
-          ditto -c -k --keepParent "$binary" "${signing_dir}/sidecar.zip"
-          xcrun notarytool submit "${signing_dir}/sidecar.zip" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --wait --output-format json > "${signing_dir}/notarization.json"
-          python3 - "${signing_dir}/notarization.json" <<'PY'
-          import json
-          import sys
-          with open(sys.argv[1], encoding='utf-8') as source:
-              result = json.load(source)
-          if result.get('status') != 'Accepted':
-              raise SystemExit('Apple 公证未接受该 Sidecar：' + str(result.get('status')))
-          PY
+      - name: Check Sidecar conformance before packaging
+        if: matrix.platform != 'any'
+        shell: pwsh
+        run: |
+          # 使用构建清单解析入口，确保跑过协议检查的是最终将打入归档的可执行文件。
+          $buildRoot = Join-Path $PWD '.kerminal/build'
+          $manifest = Get-Content -LiteralPath (Join-Path $buildRoot 'kerminal-plugin.json') -Raw | ConvertFrom-Json
+          $main = $manifest.runtime.main.($env:PLUGIN_PLATFORM)
+          $executable = Join-Path $buildRoot $main
+          & kerminal-plugin conformance $executable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Package and check archive
         shell: pwsh
         run: |

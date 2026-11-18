@@ -83,13 +83,17 @@ python -I tests/sidecar_http_e2e.py --sidecar .kerminal/build/bin/kerminal-plugi
 
 2026-11-16 在 Windows 11（`x86_64-pc-windows-msvc`，Rust 1.98.0）上按上述顺序实际执行并通过：`cargo test --locked` 共 117 个测试（70 个库测试、29 个 HTTP 契约、6 个 Origin 契约、6 个 RPC 握手、6 个视图数据）全部通过，0 失败、0 忽略；Sidecar release 构建成功；`check`、`package`、归档 `check` 与 `conformance` 均返回 0；`sidecar_http_e2e.py --sidecar` 6/6 通过，其中 5 项是脚本内的 `HelperSelfCheck`（链接解析、百分号编码、脱敏与清单身份等辅助校验），只有 1 项是真实 Sidecar 进程的完整流程（配对、列目录、上传不覆盖、下载、Range、停止后旧令牌/票据失效、重启与 `shutdown` 回收），不是 6 个独立的真实场景。本轮构建使用工作区既有的 `.kerminal-sdk` junction（其 HEAD 为固定提交 `ea099eb33a562422cb1bfd6678187a007a7d2a41`），没有重新检出或切换 SDK；`conformance` 只证明握手、身份、分帧、心跳与关闭，取消与背压未用 fixture-mode 验证。上述构建与打包产物对应本轮源码；本轮新增「单字符目标名提交」回归、重写「克隆句柄枚举游标隔离」回归，并把改名结构的 union 初始化为等价的 `Flags: 0`；单字符回归先复现了 22 字节被内核以 `ERROR_BAD_LENGTH`（24）拒绝，修复为长度下限取 `size_of::<FILE_RENAME_INFORMATION>()` 后复跑通过。
 
-`cargo test --locked` 依赖已提交的 `Cargo.lock`；本目录当前不是 git 仓库，发布前必须在目标仓库中把 `Cargo.lock` 纳入跟踪。真实浏览器、真实局域网、宿主安装以及 macOS/Linux 原生运行仍需在对应环境单独验收。
+`cargo test --locked` 依赖已提交的 `Cargo.lock`。真实浏览器、真实局域网、宿主安装以及 macOS/Linux 原生运行仍需在对应环境单独验收。
+
+## 发布
+
+在[插件源码仓库](https://github.com/kongweiguang/kerminal-plugin-lan-transfer)推送与清单版本匹配的 `v*` 标签后，GitHub Actions 使用 `KERMINAL_SDK_REF` 固定的 SDK 提交构建 Windows x64、Linux x64、macOS Intel 和 macOS Apple Silicon 的 `.kplugin`。四个平台的包全部通过校验、上传并回读比对后，工作流才公开 Release。SDK 的配置方法见上面的构建说明。
+
+所有版本（含正式版）对 macOS Sidecar 仅做本地 ad-hoc 签名和严格完整性验证，不使用 Apple Developer ID 证书，也不提交 Apple 公证。ad-hoc 签名不证明发布者身份；下载后仍受系统 Gatekeeper 策略约束，可能无法启动。CI 构建和协议检查不代替 macOS 桌面上的真实安装验收。
 
 ## 已知限制
 
 - 面板使用 `qrcode` 原生节点。相关源码已随 Sidecar 完成 release 编译，并通过真实 Sidecar 的 `view.snapshot`/`view.open`/`view.action` 黑盒联调；原生窗口渲染与宿主安装仍未验收，在完成这些验证之前不声称桌面端可用。
-- 构建使用本地 SDK 路径；本仓库核对时可公开获取的固定 SDK 提交是 `ea099eb33a562422cb1bfd6678187a007a7d2a41`（`kongweiguang/Kerminal`），发布前应把 `KERMINAL_SDK_REF` 设为该完整 SHA。该提交只证明 SDK 源码可追溯，不等于发布签名、Release 或市场登记已完成；在完成本地打包与真实 Release 前不推送 `v*` 标签。
-- 清单 `repository` 指向 `https://github.com/kongweiguang/kerminal-plugin-lan-transfer`，该地址在本次核对时尚未公开（`git ls-remote` 返回 `Repository not found`）；发布前必须先建立并公开该仓库，否则市场登记与 Release 下载地址不可用。本次未创建远端、未推送、未发布。
 - 清单声明 `api: ">=1.1.0 <2.0.0"`，当前宿主权威常量 `HOST_API_VERSION` 为 `1.1.0`（`crates/application/src/plugins.rs`），因此该范围与当前宿主兼容；宿主在安装、启动与贡献注册三处都用同一套 npm 范围语义校验 `manifest.api`，更旧的 1.0 宿主仍会拒绝加载。此结论来自宿主源码与测试，不是本轮桌面安装验收。
 - 真实浏览器反嵌入、真实局域网与 macOS/Linux 原生运行未验收；Windows 无目录 fsync，不对崩溃后的目录项持久性作承诺。
 - 共享目录当前需要创建权限：只读 ACL（缺少创建文件/子目录权限）的目录无法作为可读共享目录打开；本轮不修改权限模型。

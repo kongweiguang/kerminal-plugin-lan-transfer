@@ -1,8 +1,7 @@
-# 发布工作流结构门禁测试：完全本地离线，不调用 GitHub、网络、签名或公证。
-# 测试对象是 .github/workflows/release.yml 内嵌脚本的真实逻辑：plan 的平台核对、
-# 依赖锁定前置检查、publish 的期望资产集合、市场条目预生成与 macOS 签名/公证
-# fail-closed 门禁。gh 用本机假命令按场景返回，仅模拟命令行契约，不代表真实 GitHub
-# 行为；Cargo.lock 门禁用本机 pwsh 执行工作流中的真实片段，不构建、不联网。
+# 发布工作流结构门禁测试：完全本地离线，不调用 GitHub 或真实签名工具。
+# 直接运行内嵌脚本以覆盖平台、锁文件、市场条目、资产回读和本地签名的失败路径。
+# gh 与 codesign 由 stub 模拟命令行契约，不代表 GitHub 或 macOS 的实际行为；
+# Cargo.lock 门禁用本机 pwsh 执行工作流中的真实片段，不构建、不联网。
 # bash step 的报错标注（echo ::error::）写在标准输出，断言以 stdout 为准。
 # @author kongweiguang
 
@@ -136,7 +135,8 @@ def lock_precheck_script() -> str:
 
 @pytest.fixture(scope="module")
 def signing_script() -> str:
-    return _step_run("build", "Sign and notarize macOS Sidecar when configured")
+    """直接执行发布脚本，避免单独维护一份会与实际签名路径漂移的测试实现。"""
+    return _step_run("build", "Ad-hoc sign and verify macOS Sidecar")
 
 
 # ---------------------------------------------------------------------------
@@ -519,90 +519,70 @@ def test_post_build_lock_hash_gate_fails_when_snapshot_missing(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# macOS 签名/公证门禁
+# macOS 本地签名及完整性门禁
 # ---------------------------------------------------------------------------
 
-def _run_signing(script: str, room: Path, secrets: dict[str, str]) -> subprocess.CompletedProcess:
-    """在受控目录执行签名 step：按构建清单声明的路径预置假二进制，让脚本推进到 Secret 门禁。"""
-    manifest = _sidecar_manifest(["macos-aarch64"])
+def _run_signing(script: str, room: Path, platform: str, ref: str, fail_on: str = ""):
+    """隔离真实签名工具；使用带空格的入口和逐参数日志，捕获路径拆分及调用顺序错误。"""
+    manifest = _sidecar_manifest(["macos-x86_64", "macos-aarch64"])
+    for arch in manifest["runtime"]["main"]:
+        manifest["runtime"]["main"][arch] = f"bin/tools {arch}/sidecar"
     build_dir = room / ".kerminal" / "build"
-    build_dir.mkdir(parents=True, exist_ok=True)
+    binary = build_dir / manifest["runtime"]["main"][platform]
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"test-sidecar")
     (build_dir / "kerminal-plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
-    # 二进制必须位于清单 runtime.main 声明的相对路径，否则脚本在 test -f 处静默失败，
-    # 门禁逻辑根本不会执行。
-    declared = manifest["runtime"]["main"]["macos-aarch64"]
-    binary = build_dir.joinpath(*declared.split("/"))
-    binary.parent.mkdir(parents=True, exist_ok=True)
-    binary.write_bytes(b"MZ")
-    env = _base_env()
-    env.update({"PLUGIN_PLATFORM": "macos-aarch64", "RUNNER_TEMP": str(room)})
-    for name, value in secrets.items():
-        env[name] = value
-    return subprocess.run(
-        [*_bash_command(), "-c", script],
-        cwd=room, env=env, capture_output=True,
+    bin_dir = _write_stub(room, "codesign", '''
+operation=$1
+printf '%s\\n' "$@" >> codesign.log
+[ "$operation" != "$FAIL_ON" ] || exit 23
+''')
+    env = {name: value for name, value in _base_env().items() if not name.upper().startswith("APPLE_")}
+    env.update({
+        "PLUGIN_PLATFORM": platform,
+        "GITHUB_REF_NAME": ref,
+        "FAIL_ON": fail_on,
+        "PATH": str(bin_dir) + os.pathsep + env["PATH"],
+    })
+    completed = subprocess.run(
+        [*_bash_command(), "-c", script], cwd=room, env=env, capture_output=True,
         text=True, encoding="utf-8", errors="replace", timeout=60,
     )
+    arguments = (room / "codesign.log").read_text(encoding="utf-8").splitlines()
+    return completed, arguments, binary
 
 
-def test_signing_gate_fail_closed_when_all_missing(signing_script, tmp_path):
-    """任何所需 Secret 缺失时签名 step 必须以非零码退出，不允许 warning 后继续。"""
-    completed = _run_signing(signing_script, tmp_path, {
-        "APPLE_CERTIFICATE_BASE64": "",
-        "APPLE_CERTIFICATE_PASSWORD": "",
-        "APPLE_SIGNING_IDENTITY": "",
-        "APPLE_ID": "",
-        "APPLE_TEAM_ID": "",
-        "APPLE_APP_SPECIFIC_PASSWORD": "",
-    })
-    assert completed.returncode != 0, completed.stdout
-    assert "缺少 Secret" in completed.stdout
-    assert "::warning::" not in completed.stdout
+@pytest.mark.parametrize("platform", ["macos-x86_64", "macos-aarch64"])
+@pytest.mark.parametrize("ref", ["v0.1.0", "v0.1.0-preview.1"])
+def test_signing_uses_only_adhoc_for_all_macos_releases(signing_script, tmp_path, platform, ref):
+    """两个架构的正式和预发布构建必须使用相同策略，并校验签过的同一个入口。"""
+    completed, args, binary = _run_signing(signing_script, tmp_path, platform, ref)
+    assert completed.returncode == 0, completed.stderr
+    assert args[:3] == ["--force", "--sign", "-"]
+    assert args[4:7] == ["--verify", "--strict", "--verbose=2"]
+    assert len(args) == 8 and Path(args[3]) == Path(args[7]) == binary
 
 
-def test_signing_gate_fail_closed_when_notarization_secrets_missing(signing_script, tmp_path):
-    """签名 Secret 齐全而公证 Secret 缺失时同样 fail closed（旧工作流在此放行）。"""
-    completed = _run_signing(signing_script, tmp_path, {
-        "APPLE_CERTIFICATE_BASE64": "AAAA",
-        "APPLE_CERTIFICATE_PASSWORD": "pw",
-        "APPLE_SIGNING_IDENTITY": "Developer ID Application",
-        "APPLE_ID": "",
-        "APPLE_TEAM_ID": "",
-        "APPLE_APP_SPECIFIC_PASSWORD": "",
-    })
-    assert completed.returncode != 0, completed.stdout
-    assert "缺少 Secret" in completed.stdout
-    assert "APPLE_ID" in completed.stdout
-    assert "APPLE_APP_SPECIFIC_PASSWORD" in completed.stdout
-    # 到达门禁即退出：不能触碰钥匙串或签名流程，目录里不应有签名痕迹。
-    assert not list((tmp_path / ".kerminal" / "build").glob("*.p12"))
+@pytest.mark.parametrize("fail_on", ["--force", "--verify"])
+def test_signing_and_verification_fail_closed(signing_script, tmp_path, fail_on):
+    """签名或验证失败都不得进入后续打包；签名失败后不运行验证以免误验原始文件。"""
+    completed, args, _ = _run_signing(signing_script, tmp_path, "macos-aarch64", "v0.1.0", fail_on)
+    assert completed.returncode == 23
+    assert ("--verify" in args) == (fail_on == "--verify")
 
 
-def test_signing_gate_reports_without_leaking_secret_values(signing_script, tmp_path):
-    """报错只列 Secret 名称，任何 Secret 值都不得出现在输出中。"""
-    secret = "top-secret-value-do-not-leak"
-    completed = _run_signing(signing_script, tmp_path, {
-        "APPLE_CERTIFICATE_BASE64": "AAAA",
-        "APPLE_CERTIFICATE_PASSWORD": "pw",
-        "APPLE_SIGNING_IDENTITY": "Developer ID Application",
-        "APPLE_ID": "",
-        "APPLE_TEAM_ID": secret,
-        "APPLE_APP_SPECIFIC_PASSWORD": "",
-    })
-    assert completed.returncode != 0
-    combined = completed.stdout + completed.stderr
-    assert "缺少 Secret" in combined
-    assert secret not in combined
-
-
-def test_workflow_declares_gate_comments():
-    """工作流头注释声明签名/公证门禁与锁定依赖门禁的存在与原因。"""
+def test_workflow_checks_final_sidecar_before_packaging():
+    """限制本地签名的触发范围，并保证协议检查覆盖实际打包的最终 Sidecar。"""
+    signing = _step("build", "Ad-hoc sign and verify macOS Sidecar")
+    conformance = _step("build", "Check Sidecar conformance before packaging")
+    assert signing["if"] == "runner.os == 'macOS' && matrix.platform != 'any'"
+    assert "env" not in signing
+    assert conformance["if"] == "matrix.platform != 'any'"
+    assert "kerminal-plugin conformance $executable" in conformance["run"]
     text = WORKFLOW.read_text(encoding="utf-8")
-    assert "必须完成" in text and "签名与公证" in text
-    assert "--locked" in text
-    assert "@author kongweiguang" in text
-    # 注释必须与实际触发范围一致：所有 v*（含预发布）都走同一门禁。
-    assert "任意 v* tag" in text
+    assert "APPLE_" not in text and "notarytool" not in text
+    assert text.index(signing["name"]) < text.index(conformance["name"]) < text.index("Package and check archive")
+    assert "--locked" in text and "@author kongweiguang" in text
 
 
 def test_install_cli_checks_full_sdk_tree():
