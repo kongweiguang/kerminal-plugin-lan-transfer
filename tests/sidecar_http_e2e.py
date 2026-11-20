@@ -164,6 +164,16 @@ class RpcClient:
         self._stderr_thread = None
         self._write_lock = threading.Lock()
         self._ids = itertools.count(1)
+        # 假宿主剪贴板：E2E 不碰系统剪贴板，只按模式回应插件发起的
+        # `clipboard.write`。`notifications` 保存本次请求期间跳过的推送，
+        # 供断言「拒绝写入时没有复制确认」。
+        self.clipboard_mode = "ack"
+        self.clipboard_requests = 0
+        self.clipboard_texts = []
+        self.notifications = []
+        # `hold` 模式把 ACK 延迟到测试显式放行，用真实 RPC 顺序制造
+        # 「等待宿主确认期间另一窗口停止服务」的竞态，不修改被测二进制。
+        self.clipboard_deferred = []
 
     def start(self):
         """启动子进程并开始排空两条管道；失败时不留半启动状态。"""
@@ -238,8 +248,24 @@ class RpcClient:
         宿主发往插件的请求 ID 必须以 `h:` 开头：SDK 的 `RpcRequest::validate`
         按发起方校验前缀，用别的命名会在握手前就被判成 invalid request。
         """
+        reply, self.notifications = self.request_with_notifications(method, params, timeout)
+        return reply
+
+    def send_request(self, method, params):
+        """写入请求但不等待回执；供故意延迟 ACK 的竞态用例使用。"""
         request_id = f"h:{next(self._ids)}"
         self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        return request_id
+
+    def request_with_notifications(self, method, params, timeout):
+        """发送请求，返回回执与本次调用期间收到的全部通知。
+
+        业务动作失败会先向调用窗口推送局部错误，再返回协议错误；只读取带 id 的
+        帧会把这条通知丢进历史，后续断言就无法确认调用窗口是否真的收到错误。
+        """
+        request_id = f"h:{next(self._ids)}"
+        self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        notifications = []
         end = time.monotonic() + timeout
         while True:
             remaining = end - time.monotonic()
@@ -255,9 +281,88 @@ class RpcClient:
                     f"stderr tail: {self.stderr_tail()}"
                 )
             if message.get("id") == request_id:
-                return message
+                return message, notifications
             if "__invalid__" in message:
                 raise AssertionError(f"invalid NDJSON frame: {_safe_body(message['__invalid__'])}")
+            # 插件发起的宿主方法请求（`p:` id）必须由测试假宿主回应，
+            # 否则 `clipboard.write` 会一直等待；这里不调用任何系统剪贴板。
+            if message.get("method") == "clipboard.write" and message.get("id"):
+                self._answer_clipboard(message)
+                continue
+            # 通知与响应可以交错；保留下来供断言，然后继续等自己的回执。
+            notifications.append(message)
+
+    def receive_plugin_request(self, client, method, timeout=RPC_TIMEOUT):
+        """等待插件向宿主发起指定请求；只跳过无关的 view.update 通知。"""
+        end = time.monotonic() + timeout
+        while True:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(f"等待插件请求 {method} 超时")
+            try:
+                message = client._queue.get(timeout=remaining)
+            except queue.Empty as error:
+                raise AssertionError(f"等待插件请求 {method} 超时") from error
+            if message is None:
+                raise AssertionError(f"sidecar stdout closed before {method}")
+            if message.get("method") == method and message.get("id"):
+                return message
+            if message.get("method") != "view.update":
+                client.notifications.append(message)
+
+    def receive_with_reply(self, client, timeout=RPC_TIMEOUT):
+        """读取下一条带 id 的回执，并收集此前的 view.update 通知。
+
+        延迟 ACK 的复制请求会在回执之前发出一条局部错误通知；固定只读回执会漏掉
+        这条通知，无法验证「失败只更新调用窗口」。这里不解析通知内容，只保留帧。
+        """
+        notifications = []
+        end = time.monotonic() + timeout
+        while True:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError("等待复制回执超时")
+            try:
+                message = client._queue.get(timeout=remaining)
+            except queue.Empty as error:
+                raise AssertionError("等待复制回执超时") from error
+            if message is None:
+                raise AssertionError("sidecar stdout closed before copy reply")
+            if message.get("id"):
+                return message, notifications
+            if message.get("method") == "clipboard.write" and message.get("id"):
+                client._answer_clipboard(message)
+            else:
+                notifications.append(message)
+
+    def _answer_clipboard(self, request):
+        """用协议帧模拟宿主剪贴板 ACK/拒绝，保持测试进程不触碰系统剪贴板。"""
+        self.clipboard_requests += 1
+        params = request.get("params") or {}
+        text = params.get("text")
+        self.clipboard_texts.append(text if isinstance(text, str) else None)
+        if self.clipboard_mode == "refuse":
+            self._write(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "error": {"code": -32001, "message": "clipboard denied"},
+                }
+            )
+            return
+        if self.clipboard_mode == "hold":
+            # 真实顺序：插件先发出 clipboard.write，测试在另一实例完成 stop 后才
+            # 写回 ACK。延迟由假宿主控制，无需在被测进程里加测试钩子。
+            self.clipboard_deferred.append(request["id"])
+            return
+        self._write({"jsonrpc": "2.0", "id": request["id"], "result": {}})
+
+    def release_clipboard(self):
+        """放行所有被延迟的剪贴板请求；调用者保证此前已让竞态动作执行完成。"""
+        deferred, self.clipboard_deferred = self.clipboard_deferred, []
+        for request_id in deferred:
+            self._write({"jsonrpc": "2.0", "id": request_id, "result": {}})
+        return len(deferred)
 
     def notify(self, method, params):
         """通知没有回执；用于 `initialized`，失败与请求同样视为协议断开。"""
@@ -653,6 +758,12 @@ class SidecarEndToEnd(unittest.TestCase):
         )
         self.assertFalse(result["data"]["running"])
         self.assertIsInstance(result["data"]["stats"], str)
+        # 空闲态允许编辑并只提供启动动作；复制按钮显示默认文案且没有错误行。
+        self.assertTrue(result["data"]["editable"])
+        self.assertTrue(result["data"]["can_start"])
+        self.assertFalse(result["data"]["can_stop"])
+        self.assertFalse(result["data"]["show_error"])
+        self.assertTrue(result["data"]["copy_label"])
 
         self._phase("start service")
         result = self._expect_ok(
@@ -674,6 +785,14 @@ class SidecarEndToEnd(unittest.TestCase):
         self.assertTrue(patch["running"])
         self.assertEqual(patch["selected_address"], "127.0.0.1")
         self.assertIsInstance(patch["address"], str)
+        # 运行后编辑入口关闭，停止入口可用；展示路径来自只读运行时字段，
+        # 不会被另一个窗口未提交的目录草稿覆盖。
+        self.assertFalse(patch["editable"])
+        self.assertFalse(patch["can_start"])
+        self.assertTrue(patch["can_stop"])
+        self.assertEqual(patch["shared_path"], str(self.share))
+        self.assertFalse(patch["show_error"])
+        self.assertTrue(patch["copy_label"])
         _, port, secret = _parse_link(patch["link"])
         self.assertEqual(patch["address"], f"127.0.0.1:{port}")
         self.http = HttpApi(port)
@@ -914,6 +1033,9 @@ class SidecarEndToEnd(unittest.TestCase):
         )
         self.assertFalse(result["patch"]["running"])
         self.assertIsNone(result["patch"]["address"])
+        self.assertTrue(result["patch"]["editable"])
+        self.assertTrue(result["patch"]["can_start"])
+        self.assertFalse(result["patch"]["can_stop"])
         self._wait_port_closed(port)
         self._assert_no_staging()
 
@@ -980,6 +1102,332 @@ class SidecarEndToEnd(unittest.TestCase):
         self.assertIsNotNone(self.rpc.proc.poll(), "进程未被回收")
         self._wait_port_closed(new_port, timeout=2)
         self._assert_no_staging()
+
+    def test_copy_link_confirmation_contract(self):
+        """复制确认只在宿主确认剪贴板写入后出现，且不触碰系统剪贴板。
+
+        这里由测试进程充当宿主，用协议帧回应 `clipboard.write`：ACK 与拒绝都不
+        调用系统剪贴板，因此可以在自动化环境里验证「未就绪不复制、拒绝不确认、
+        成功才切换按钮文案」这条完整契约，而不会污染用户剪贴板内容。
+        """
+        self._phase("copy: view.open")
+        opened = self._expect_ok(
+            self.rpc.request(
+                "view.open",
+                {"view": "lan.transfer.panel", "instance": "e2e", "scope": {}},
+                RPC_TIMEOUT,
+            ),
+            "view.open",
+        )
+        default_label = opened["data"]["copy_label"]
+        self.assertTrue(default_label, "复制按钮默认文案不能为空")
+
+        self._phase("copy: readiness gating")
+        self.rpc.clipboard_mode = "ack"
+        requests_before = self.rpc.clipboard_requests
+        reply, notifications = self.rpc.request_with_notifications(
+            "view.action", {"instance": "e2e", "action": "copy-link", "data": {}}, RPC_TIMEOUT
+        )
+        self.assertIsNotNone(reply.get("error"), "未运行时复制必须失败")
+        # 未运行属于插件可修正的业务状态，使用私有业务码而不是宿主的权限码。
+        self.assertEqual(reply["error"]["code"], -32100)
+        self.assertEqual(
+            self.rpc.clipboard_requests,
+            requests_before,
+            "未就绪时不应请求宿主写剪贴板",
+        )
+        # 业务失败的内联文案必须与协议错误消息一致，宿主才能只展示一次；
+        # 同时按钮文案保持默认值，不能被误标成已复制。
+        inline = self._inline_error_updates(self.rpc, notifications)
+        self.assertEqual(len(inline), 1, "未运行业务失败必须通知调用窗口一次")
+        self.assertIn(reply["error"]["message"], inline)
+        patches = self._notification_patches(self.rpc, notifications)
+        self.assertEqual(set(patches[0].keys()), {"error", "show_error", "copy_label"})
+        self.assertEqual(
+            patches[0]["copy_label"],
+            default_label,
+            "业务失败必须恢复调用窗口的复制按钮",
+        )
+        self.assertEqual(self.rpc.clipboard_texts[-1:], [], "未就绪时不应发送剪贴板文本")
+
+        self._phase("copy: start service")
+        started = self._expect_ok(
+            self.rpc.request(
+                "view.action",
+                {
+                    "instance": "e2e",
+                    "action": "start",
+                    "data": {
+                        "root_path": str(self.share),
+                        "selected_address": "127.0.0.1",
+                    },
+                },
+                RPC_TIMEOUT,
+            ),
+            "start",
+        )
+        _, port, _ = _parse_link(started["patch"]["link"])
+
+        self._phase("copy: clipboard text")
+        self.rpc.clipboard_mode = "ack"
+        requests_before = self.rpc.clipboard_requests
+        copied = self._expect_ok(
+            self.rpc.request(
+                "view.action", {"instance": "e2e", "action": "copy-link", "data": {}}, RPC_TIMEOUT
+            ),
+            "copy before rejection",
+        )
+        self.assertNotEqual(copied["patch"]["copy_label"], default_label)
+        self.assertEqual(self.rpc.clipboard_requests, requests_before + 1)
+        start_link = started["patch"]["link"]
+        # 复制只应把当前运行链接交给宿主，比较在失败时只输出布尔结论，
+        # 不把一次性配对链接或密钥写进断言信息/终端日志。
+        self.assertEqual(
+            self.rpc.clipboard_texts[-1:] == [start_link],
+            True,
+            "clipboard.write 文本必须等于启动回执链接（不回显原值）",
+        )
+
+        self._phase("copy: rejected write")
+        self.rpc.clipboard_mode = "refuse"
+        requests_before = self.rpc.clipboard_requests
+        reply, notifications = self.rpc.request_with_notifications(
+            "view.action", {"instance": "e2e", "action": "copy-link", "data": {}}, RPC_TIMEOUT
+        )
+        self.assertIsNotNone(reply.get("error"), "宿主拒绝剪贴板时必须上报失败")
+        # 宿主能力错误保留原始分类与消息，不能被改写或内联，否则宿主会丢失
+        # 自己的权限/拒绝提示并错误地显示插件通用文案。
+        self.assertEqual(reply["error"]["code"], -32001)
+        self.assertEqual(reply["error"]["message"], "clipboard denied")
+        self.assertEqual(
+            self.rpc.clipboard_requests,
+            requests_before + 1,
+            "拒绝路径也必须真的请求过一次剪贴板",
+        )
+        self.assertFalse(
+            any("copy_label" in patch for patch in self._notification_patches(self.rpc, notifications)),
+            "宿主拒绝后不应出现复制确认",
+        )
+        self.assertFalse(self._inline_error_updates(self.rpc, notifications), "宿主错误不应写入插件内联错误")
+
+        self._phase("copy: acknowledged write")
+        self.rpc.clipboard_mode = "ack"
+        requests_before = self.rpc.clipboard_requests
+        result = self._expect_ok(
+            self.rpc.request(
+                "view.action", {"instance": "e2e", "action": "copy-link", "data": {}}, RPC_TIMEOUT
+            ),
+            "copy-link",
+        )
+        patch = result["patch"]
+        # 复制成功回执只包含调用窗口的按钮文案；link/qr 等全量状态字段不能
+        # 借这次剪贴板动作写回宿主，否则会反写另一窗口刚提交的生命周期结果。
+        self.assertEqual(set(patch.keys()), {"copy_label"}, "复制回执必须只含按钮文案")
+        self.assertTrue(patch["copy_label"], "复制确认文案不能为空")
+        self.assertNotEqual(patch["copy_label"], default_label, "ACK 后应切换按钮文案")
+        self.assertEqual(self.rpc.clipboard_requests, requests_before + 1)
+        self.assertEqual(
+            self.rpc.clipboard_texts[-1:] == [start_link],
+            True,
+            "确认复制的文本必须仍是启动链接（不回显原值）",
+        )
+        # 复制确认只属于发起窗口：协议栈不应产生任何跨实例 view.update。
+        self.assertFalse(
+            self._notification_patches(),
+            "复制确认不应广播给其他实例",
+        )
+
+        self._phase("copy: stop resets label")
+        stopped = self._expect_ok(
+            self.rpc.request(
+                "view.action", {"instance": "e2e", "action": "stop", "data": {}}, RPC_TIMEOUT
+            ),
+            "stop",
+        )
+        self.assertEqual(stopped["patch"]["copy_label"], default_label)
+        self._wait_port_closed(port)
+
+        self._phase("copy: gated again after stop")
+        requests_before = self.rpc.clipboard_requests
+        reply, notifications = self.rpc.request_with_notifications(
+            "view.action", {"instance": "e2e", "action": "copy-link", "data": {}}, RPC_TIMEOUT
+        )
+        self.assertIsNotNone(reply.get("error"))
+        self.assertEqual(reply["error"]["code"], -32100)
+        self.assertEqual(self.rpc.clipboard_requests, requests_before)
+
+        self._phase("copy: shutdown")
+        self._expect_ok(self.rpc.request("shutdown", {}, EXIT_TIMEOUT), "shutdown")
+        self.assertEqual(self.rpc.wait_exit(EXIT_TIMEOUT), 0, "shutdown 后必须正常退出")
+        self._wait_port_closed(port, timeout=2)
+        self._assert_no_staging()
+
+    def test_copy_link_stale_after_other_instance_stop(self):
+        """ACK 前的另一窗口 stop 必须让复制失败，且不能回写旧链接或广播确认。
+
+        同一条 Sidecar 连接上打开两个视图实例，模拟同一宿主的两个面板窗口；
+        假宿主把第一个实例的 clipboard.write ACK 留在真实线协议里等待，等第二实例
+        stop 完成后再放行。这样测到的是插件在 ACK 后复核状态的时序，而不是人工
+        调用内部函数的白盒结果。
+        """
+        copy_client = self.rpc
+        other = copy_client
+        for instance in ("copy-window", "other-window"):
+            opened = self._expect_ok(
+                copy_client.request(
+                    "view.open",
+                    {"view": "lan.transfer.panel", "instance": instance, "scope": {}},
+                    RPC_TIMEOUT,
+                ),
+                "view.open",
+            )
+            self.assertTrue(opened["data"]["copy_label"])
+
+        started = self._expect_ok(
+            copy_client.request(
+                "view.action",
+                {
+                    "instance": "copy-window",
+                    "action": "start",
+                    "data": {"root_path": str(self.share), "selected_address": "127.0.0.1"},
+                },
+                RPC_TIMEOUT,
+            ),
+            "start",
+        )
+        start_link = started["patch"]["link"]
+        _, port, _ = _parse_link(start_link)
+        # start 按现有语义广播完整生命周期状态；这一阶段只确认广播没有把
+        # 复制确认当作共享状态扩散。复制动作的独立断言在 ACK 之后进行。
+        self.assertFalse(
+            any(
+                patch.get("copy_label") not in (None, opened["data"]["copy_label"])
+                for patch in self._notification_patches(copy_client)
+            ),
+            "启动广播不能扩散复制确认",
+        )
+
+        copy_client.clipboard_mode = "hold"
+        texts_before = len(copy_client.clipboard_texts)
+        # 这个请求故意不等回执：假宿主在 other-window stop 完成后才放行 ACK。
+        copy_request_id = copy_client.send_request(
+            "view.action",
+            {"instance": "copy-window", "action": "copy-link", "data": {}},
+        )
+        # 先排空来自 copy-window 的 clipboard.write，再等其他窗口完成 stop；
+        # 这样 stop 的完整回执已经在另一条连接上落地，但 copy 的 ACK 仍未发出。
+        copy_client._answer_clipboard(
+            copy_client.receive_plugin_request(copy_client, "clipboard.write")
+        )
+        self.assertEqual(len(copy_client.clipboard_deferred), 1, "剪贴板请求必须真实发出")
+        self.assertEqual(
+            copy_client.clipboard_texts[texts_before:] == [start_link],
+            True,
+            "剪贴板文本必须等于启动回执链接（不回显原值）",
+        )
+        # 在 ACK 前完成第二窗口的 stop：此时状态与会话已经撤销，旧链接失效。
+        stopped = self._expect_ok(
+            other.request(
+                "view.action",
+                {"instance": "other-window", "action": "stop", "data": {}},
+                RPC_TIMEOUT,
+            ),
+            "stop from other instance",
+        )
+        self.assertFalse(stopped["patch"]["running"])
+        self.assertIsNone(stopped["patch"]["link"])
+        self.assertEqual(copy_client.release_clipboard(), 1)
+
+        # 延迟 ACK 已放行，只读对应 id 的回执并收集通知。
+        stale_reply, stale_notifications = copy_client.receive_with_reply(copy_client)
+        self.assertEqual(stale_reply.get("id"), copy_request_id, "读取的必须是延迟复制回执")
+        self.assertNotIn("result", stale_reply, "延迟复制不得返回成功 patch")
+        stale_error = stale_reply.get("error")
+        self.assertIsNotNone(stale_error, f"复制在 ACK 后失效必须失败：{_safe_body(stale_reply)}")
+        self.assertEqual(stale_error["code"], -32100)
+        self.assertEqual(len(stale_notifications), 1, "调用窗口应收到一条局部失败更新")
+        stale_patch = self._notification_patches(copy_client, stale_notifications)[0]
+        self.assertEqual(stale_patch["error"], stale_error["message"])
+        self.assertEqual(stale_patch["copy_label"], opened["data"]["copy_label"])
+        self.assertNotIn("link", stale_patch, "不得回写旧链接")
+        self.assertNotIn("qr", stale_patch, "不得回写旧二维码")
+
+        # 重新启动必须生成新链接；若插件把停掉的旧链接当成当前链接，
+        # 这里会识别出错误的代次，且断言不会在失败时输出密钥原文。
+        copy_client.clipboard_mode = "ack"
+        # 复制失败后，只把该动作产生的通知清掉，避免影响下一动作的观察。
+        copy_client.notifications = []
+        restarted = self._expect_ok(
+            copy_client.request(
+                "view.action",
+                {
+                    "instance": "copy-window",
+                    "action": "start",
+                    "data": {"root_path": str(self.share), "selected_address": "127.0.0.1"},
+                },
+                RPC_TIMEOUT,
+            ),
+            "restart after stale copy",
+        )
+        new_link = restarted["patch"]["link"]
+        self.assertEqual(new_link == start_link, False, "复启不能沿用旧链接（不回显原值）")
+        copy_client.notifications = []
+        copy_client.clipboard_mode = "ack"
+        copy_client.request(
+            "view.action",
+            {"instance": "copy-window", "action": "copy-link", "data": {}},
+            RPC_TIMEOUT,
+        )
+        self.assertEqual(
+            copy_client.clipboard_texts[-1:] == [new_link],
+            True,
+            "复启后复制必须使用新链接（不回显原值）",
+        )
+        self.assertFalse(
+            self._notification_patches(copy_client),
+            "复启后的复制仍不能广播",
+        )
+
+        self._expect_ok(
+            copy_client.request(
+                "view.action", {"instance": "copy-window", "action": "stop", "data": {}},
+                RPC_TIMEOUT,
+            ),
+            "stop after stale copy",
+        )
+        self._expect_ok(copy_client.request("shutdown", {}, EXIT_TIMEOUT), "shutdown")
+        self.assertEqual(copy_client.wait_exit(EXIT_TIMEOUT), 0, "shutdown 后必须正常退出")
+
+    def _notification_patches(self, client=None, messages=None):
+        """取出指定客户端收到的 `view.update` 补丁。
+
+        只读取通知参数里的 `patch`；其他通知（或未来新增的通知族）不参与
+        复制字段判断，避免把无关推送误当成确认。
+        """
+        if client is None:
+            client = self.rpc
+        if messages is None:
+            messages = client.notifications
+        patches = []
+        for message in messages:
+            if message.get("method") != "view.update":
+                continue
+            patch = (message.get("params") or {}).get("patch")
+            if isinstance(patch, dict):
+                patches.append(patch)
+        return patches
+
+    def _inline_error_updates(self, client=None, messages=None):
+        """收集带 `show_error` 的内联错误文案；用于验证协议错误与面板文案一致。
+
+        宿主抑制通用错误依赖两者逐字相同，这里把通知里的错误串收集出来比较，
+        而不是依赖界面可见性，脚本无需启动真实窗口。
+        """
+        return [
+            patch["error"]
+            for patch in self._notification_patches(client, messages)
+            if patch.get("show_error") and isinstance(patch.get("error"), str)
+        ]
 
     def _wait_no_visible_staging(self, timeout):
         """等待命名暂存与最终文件从共享目录消失；返回是否在窗口内清空。

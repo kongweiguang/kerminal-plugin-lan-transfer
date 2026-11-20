@@ -157,7 +157,9 @@ impl State {
             ));
         }
         inner.selected_address = value.to_owned();
-        inner.error = None;
+        // 不在这里清 `error`：失败说明通常指向目录或绑定原因，用户只是修正地址
+        // 时不应该把原失败原因抹掉，否则面板会只剩「操作失败」而没有任何依据。
+        // 下一次启动会由 `begin_start` 清空旧错误并生成新的结果。
         Ok(())
     }
 
@@ -471,6 +473,19 @@ mod tests {
         );
         // 非法文本同样拒绝，不静默回退到旧值。
         assert!(state.select_address("not-an-ip").is_err());
+    }
+
+    /// 失败态修正监听地址时不能清掉原失败说明：用户只是改地址，并不代表
+    /// 目录或绑定故障的原因已经解决；面板仍需显示上一次的具体原因。
+    #[test]
+    fn failed_explanation_survives_address_edit() {
+        let state = idle();
+        state.begin_start().unwrap();
+        state.mark_failed("无法绑定该地址与端口".into()).unwrap();
+        state.select_address("127.0.0.1").unwrap();
+        let snapshot = state.snapshot().unwrap();
+        assert_eq!(snapshot.phase, Phase::Failed);
+        assert_eq!(snapshot.error.as_deref(), Some("无法绑定该地址与端口"));
     }
 
     /// 停止后必须清空链接、二维码、地址与时间戳；统计保留用于回看本次会话。

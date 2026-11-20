@@ -28,14 +28,41 @@ async fn send(writer: &mut tokio::io::WriteHalf<DuplexStream>, value: Value) {
     writer.write_all(&bytes).await.unwrap();
 }
 
-/// 有限等待读取一帧；协议阻塞时让测试失败而不是永久挂起。
-async fn receive(reader: &mut BufReader<tokio::io::ReadHalf<DuplexStream>>) -> Value {
+/// 读取一帧；协议阻塞时让测试失败而不是永久挂起。
+async fn receive_frame(reader: &mut BufReader<tokio::io::ReadHalf<DuplexStream>>) -> Value {
     let mut line = String::new();
     tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
         .await
         .expect("protocol reply timed out")
         .expect("read reply");
     serde_json::from_str(&line).expect("valid NDJSON frame")
+}
+
+/// 有限等待读取一帧回复；主动 `view.update` 通知可能先于动作回执到达，必须跳过。
+///
+/// 协议允许通知与响应交错，失败动作现在会先推送内联错误再返回协议错误；若测试
+/// 固定读取下一帧，就会把通知误当回执。只在看到带 `id` 的响应时返回。
+async fn receive(reader: &mut BufReader<tokio::io::ReadHalf<DuplexStream>>) -> Value {
+    loop {
+        let value = receive_frame(reader).await;
+        if value.get("id").is_some() {
+            return value;
+        }
+    }
+}
+
+/// 读取动作回执，同时收集交错到达的通知，用于断言内联错误确实进了视图数据。
+async fn receive_with_notifications(
+    reader: &mut BufReader<tokio::io::ReadHalf<DuplexStream>>,
+) -> (Value, Vec<Value>) {
+    let mut notifications = Vec::new();
+    loop {
+        let value = receive_frame(reader).await;
+        if value.get("id").is_some() {
+            return (value, notifications);
+        }
+        notifications.push(value);
+    }
 }
 
 /// 宿主握手参数；字段与 `InitializeParams` 完全一致（`deny_unknown_fields`）。
@@ -121,14 +148,41 @@ async fn handshake_serves_view_methods_and_shutdown_reclaims() {
     assert_eq!(reply["result"]["data"]["running"], false);
     assert!(reply["result"]["data"]["stats"].is_string());
 
-    // 动作在停止状态下不能静默成功：start 缺目录走参数错误，stop 幂等成功。
+    // 动作在停止状态下不能静默成功：空目录是字段类型正确的输入错误，走私有
+    // 输入码；同一本地化文案同时进入业务错误与视图数据，宿主据此只显示一次。
     send(
         &mut write,
         json!({"jsonrpc":"2.0","id":"h:3a","method":"view.action",
+               "params":{"instance":"w1","action":"start","data":{"root_path":""}}}),
+    )
+    .await;
+    let (reply, notifications) = receive_with_notifications(&mut read).await;
+    assert_eq!(reply["error"]["code"], -32104);
+    let update = notifications
+        .iter()
+        .find(|notification| notification["method"] == "view.update")
+        .expect("validation error must update the caller view");
+    assert_eq!(update["params"]["instance"], "w1");
+    assert_eq!(update["params"]["patch"]["show_error"], true);
+    let inline = update["params"]["patch"]["error"]
+        .as_str()
+        .expect("inline validation error");
+    assert!(!inline.is_empty());
+    assert_eq!(reply["error"]["message"], inline);
+
+    // 字段缺失属于线上形状错误，仍是 -32602，且不伪造内联文案。
+    send(
+        &mut write,
+        json!({"jsonrpc":"2.0","id":"h:3b","method":"view.action",
                "params":{"instance":"w1","action":"start","data":{}}}),
     )
     .await;
-    assert_eq!(receive(&mut read).await["error"]["code"], -32602);
+    let (reply, notifications) = receive_with_notifications(&mut read).await;
+    assert_eq!(reply["error"]["code"], -32602);
+    assert!(
+        notifications.is_empty(),
+        "malformed shape must not emit inline error: {notifications:?}"
+    );
 
     // 未知方法走 SDK 的 method-not-found，而不是让进程退出。
     send(
@@ -320,8 +374,19 @@ async fn start_action_uses_snapshot_address_without_set_address() {
         }),
     )
     .await;
-    let reply = receive(&mut read).await;
-    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    let (reply, notifications) = receive_with_notifications(&mut read).await;
+    // 非本机地址是字段类型正确的输入错误：私有输入码，且内联文案与业务错误
+    // 消息逐字一致，宿主才能抑制重复提示。
+    assert_eq!(reply["error"]["code"], -32104, "{reply}");
+    let update = notifications
+        .iter()
+        .find(|notification| notification["method"] == "view.update")
+        .expect("address validation must update the caller view");
+    assert_eq!(update["params"]["patch"]["show_error"], true);
+    assert_eq!(
+        reply["error"]["message"],
+        update["params"]["patch"]["error"]
+    );
     let snapshot = controller.state.snapshot().unwrap();
     assert_eq!(snapshot.selected_address, "127.0.0.1");
     assert_eq!(snapshot.phase, Phase::Idle);

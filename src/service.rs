@@ -748,6 +748,20 @@ impl Controller {
         );
     }
 
+    /// 是否仍保留需要停止入口回收的运行资源。
+    ///
+    /// `Failed`/`Idle` 不一定还有句柄：目录缺失或绑定失败时没有任何监听任务，
+    /// 界面不应继续显示 Stop；但停止失败、取消启动或超时可能留下未确认退出的
+    /// 句柄，此时必须保留停止入口。槽位锁被占用时按「仍有资源」处理：宁可多给
+    /// 一次可回收的停止入口，也不要在无法判断时把恢复路径藏起来。
+    pub fn retains_running_resources(&self) -> bool {
+        let running = match self.running.try_lock() {
+            Ok(slot) => slot.is_some(),
+            Err(_) => return true,
+        };
+        running || self.has_orphaned()
+    }
+
     /// 是否仍有取消路径留下的未确认句柄；锁中毒按「有」处理，宁可进入停止流程
     /// 并如实失败，也不在存在未知资源时报告空闲。
     fn has_orphaned(&self) -> bool {
@@ -884,15 +898,27 @@ fn render_qr(link: &str) -> Result<String, AppError> {
 /// 共享目录的三种失败（不存在、不是目录、不可安全打开）处置方式不同：前两者用户
 /// 换一个目录即可，第三种要解释为什么被拒绝，因此按 `open_root` 的固定诊断文本区分，
 /// 而不是统一显示「不可共享」让用户无从下手。
-fn error_key(error: &AppError) -> crate::l10n::Key {
+///
+/// 视图动作层也复用这条映射，把错误以本地化文本写进面板内联错误行；协议错误码与
+/// 英文诊断仍由 `map_error` 保留，二者不互相替代。
+pub(crate) fn error_key(error: &AppError) -> crate::l10n::Key {
     use crate::l10n::Key;
+    // 停止超时可能由 Busy 的遗留回收失败改写而来；必须先看稳定诊断文本，
+    // 否则会被当成普通忙碌/内部错误，界面失去「重试停止」的提示。
+    if error.detail == "stop timed out" {
+        return Key::ErrorStopTimeout;
+    }
     match error.code {
         ErrorCode::PathRejected => match error.detail.as_str() {
             "root missing" => Key::ErrorRootMissing,
             "not a directory" => Key::ErrorRootNotDirectory,
             _ => Key::ErrorRootRejected,
         },
-        ErrorCode::BadRequest => Key::ErrorAddressInvalid,
+        ErrorCode::BadRequest => match error.detail.as_str() {
+            // 解析失败与「不是本机地址」是两种修正方式，必须给出不同文案。
+            "address not on this host" => Key::ErrorAddressNotLocal,
+            _ => Key::ErrorAddressInvalid,
+        },
         ErrorCode::Unavailable => Key::ErrorBind,
         ErrorCode::Busy => Key::ErrorBusy,
         _ => Key::ErrorInternal,

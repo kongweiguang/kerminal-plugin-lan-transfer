@@ -9,8 +9,8 @@ Kerminal 外部插件（Rust Sidecar）：在本机选择一个共享目录，�
 - 面板内选择共享目录与本机监听地址，启动后由系统分配端口，生成带高熵密钥的访问链接与二维码。
 - 浏览器打开链接后，用 URL 片段里的密钥配对，换取短期 Bearer 令牌；片段随即从历史记录中移除。
 - 目录浏览、单文件上传（同名自动改名，不覆盖）、单文件下载（短期票据 URL，浏览器原生下载与进度）。
-- 面板显示运行状态、监听地址、可用本机地址、分享链接、二维码、上传/下载计数与失败原因；停止服务会撤销全部会话与票据。
-- 「复制链接」通过宿主 `clipboard.write` 写入系统剪贴板；写入失败会作为动作错误上报，不会只在界面显示「已复制」。
+- 原生面板将目录和监听地址放在同一个分组。目录为空时禁用启动，停止入口仅在运行、停止中或仍需回收句柄时出现。运行后显示实际共享目录、监听地址、访问范围、复制入口、二维码和传输计数。Windows 盘符和 UNC 目录以常用形式显示，持久化仍使用原始路径。动作错误显示在安全提醒前，输入校验失败保留当前阶段。面板用 `x-kerminal-appearance` 声明外观，用 `x-kerminal-action-error` 合并重复提示，用 `x-kerminal-requires-text` 在界面即时判断启动按钮是否可用。旧宿主可继续加载视图，Sidecar 仍校验动作参数。
+- 「复制链接」通过宿主 `clipboard.write` 写入系统剪贴板。宿主确认写入且共享链接仍然有效时，只有发起窗口的按钮会切换为「已复制」，二维码位置不变。如果等待确认期间共享已停止或重新启动，面板会提示复制未完成，剪贴板可能仍含旧链接。写入失败会保留宿主返回的错误。
 
 ## 安全边界（必须了解）
 
@@ -86,6 +86,8 @@ python -I tests/sidecar_http_e2e.py --sidecar .kerminal/build/bin/kerminal-plugi
 
 `cargo test --locked` 依赖已提交的 `Cargo.lock`。真实浏览器、真实局域网、宿主安装以及 macOS/Linux 原生运行仍需在对应环境单独验收。
 
+2026-11-20 本轮面板布局与 RPC 回执改动后复跑 `cargo +1.98.0 test --locked`（隔离 `CARGO_TARGET_DIR=target-check`）为 129 个测试（76 个库测试、29 个 HTTP 契约、6 个 Origin 契约、6 个 RPC 握手、12 个视图数据）全部通过；`rustfmt --edition 2024 --check` 对改动文件通过；用本轮 debug Sidecar 运行 `python -I tests/sidecar_http_e2e.py --sidecar target-check/debug/kerminal-plugin-sidecar.exe` 为 7/7 通过，新增的真实子进程场景用协议内假宿主 ACK/拒绝 `clipboard.write`（不触碰系统剪贴板），验证未运行时拒绝复制、宿主拒绝时不出现确认、只有 ACK 后才切换按钮文案且不广播。SDK CLI `check` 对按当前 `resources/` 与 debug Sidecar 组装的独立临时包（未复用 `.kerminal/build`）返回 0；Windows 11 的隔离原生窗口在 1440×900、150% DPI 下覆盖浅色、深色与跟随系统，验证空目录禁用启动、无效目录反馈、修正后回环启动、复制与二维码显示、停止后清除链接和退出。使用本轮 debug 宿主和独立插件包。`v0.1.2` 发布前复跑了 Windows release 构建、包校验与 `conformance`，均通过。对 release Sidecar 的脚本运行 8/8 通过，包含跨窗口停止共享后才收到剪贴板确认的回归。
+
 ## 发布
 
 在[插件源码仓库](https://github.com/kongweiguang/kerminal-plugin-lan-transfer)推送与清单版本匹配的 `v*` 标签后，GitHub Actions 使用 `KERMINAL_SDK_REF` 固定的 SDK 提交构建 Windows x64、Linux x64、macOS Intel 和 macOS Apple Silicon 的 `.kplugin`。四个平台的包全部通过校验、上传并回读比对后，工作流才公开 Release。SDK 的配置方法见上面的构建说明。
@@ -94,7 +96,7 @@ python -I tests/sidecar_http_e2e.py --sidecar .kerminal/build/bin/kerminal-plugi
 
 ## 已知限制
 
-- 面板使用 `qrcode` 原生节点。相关源码已随 Sidecar 完成 release 编译，并通过真实 Sidecar 的 `view.snapshot`/`view.open`/`view.action` 黑盒联调；原生窗口渲染与宿主安装仍未验收，在完成这些验证之前不声称桌面端可用。
+- 原生二维码已在 Windows 调试宿主渲染验证。扫码跨设备访问、系统目录选择器、系统剪贴板与宿主安装仍需单独验收。
 - 清单声明 `api: ">=1.1.0 <2.0.0"`，当前宿主权威常量 `HOST_API_VERSION` 为 `1.1.0`（`crates/application/src/plugins.rs`），因此该范围与当前宿主兼容；宿主在安装、启动与贡献注册三处都用同一套 npm 范围语义校验 `manifest.api`，更旧的 1.0 宿主仍会拒绝加载。此结论来自宿主源码与测试，不是本轮桌面安装验收。
 - 真实浏览器反嵌入、真实局域网与 macOS/Linux 原生运行未验收；Windows 无目录 fsync，不对崩溃后的目录项持久性作承诺。
 - 共享目录当前需要创建权限：只读 ACL（缺少创建文件/子目录权限）的目录无法作为可读共享目录打开；本轮不修改权限模型。
