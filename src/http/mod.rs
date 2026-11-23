@@ -11,7 +11,7 @@ pub mod files;
 pub mod upload;
 
 use std::{
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -163,14 +163,49 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// `Host` 头的校验策略，必须与本次实际绑定方式一致。
+///
+/// 单地址监听沿用逐字比较，允许回环绑定时使用 `localhost`。通配监听则只接受
+/// 启动时冻结的本机 IPv4 字面量加实际端口：这样浏览器可以用任意一块本机网卡
+/// 打开页面，但 `Host: attacker.example`、`0.0.0.0` 与未分配的地址仍然失败；
+/// 运行期不再枚举网卡，避免同一个服务在两次请求之间突然改变放行集合。
+#[derive(Clone, Debug)]
+pub enum HostPolicy {
+    Single(SocketAddr),
+    Wildcard { port: u16, allowed: Arc<[Ipv4Addr]> },
+}
+
+impl HostPolicy {
+    /// 具体地址监听：完全沿用原有的 Host 校验语义。
+    pub fn single(bound: SocketAddr) -> Self {
+        Self::Single(bound)
+    }
+
+    /// 通配监听：只接受冻结的本机 IPv4 集合与实际端口。
+    pub fn wildcard(port: u16, allowed: Vec<Ipv4Addr>) -> Self {
+        Self::Wildcard {
+            port,
+            allowed: allowed.into(),
+        }
+    }
+
+    /// 本次请求的 `Host` 是否被允许；缺少或不可解析的 Host 一律失败关闭。
+    fn allows(&self, host: Option<&HeaderValue>) -> bool {
+        match self {
+            Self::Single(bound) => host_allowed(bound, host),
+            Self::Wildcard { port, allowed } => wildcard_host_allowed(*port, allowed, host),
+        }
+    }
+}
+
 /// HTTP 处理器共享的上下文；`root` 在服务运行期间只读，停止时随整个服务一起丢弃。
 pub struct AppContext {
     pub state: Arc<State>,
     pub sessions: Sessions,
     pub tickets: Tickets,
     pub root: ShareRoot,
-    /// 本次绑定地址；用于精确校验 `Host` 头。
-    pub bound: SocketAddr,
+    /// 本次监听的 Host 校验策略；通配监听与具体地址监听在这里分流。
+    pub hosts: HostPolicy,
     /// 本代取消信号与在途计数；见 `RunHandle`。
     pub run: RunHandle,
     /// 统计变更信号；HTTP 完成上传/下载后递增，视图监听任务据此推送 `view.update`。
@@ -296,7 +331,7 @@ async fn guard(
     let host = request.headers().get(header::HOST).cloned();
     let origin = request.headers().get(header::ORIGIN).cloned();
     let method = request.method().clone();
-    let mut response = if !host_allowed(&context.bound, host.as_ref()) {
+    let mut response = if !context.hosts.allows(host.as_ref()) {
         error_response(AppError::new(ErrorCode::BadRequest, "host rejected"))
     } else if !origin_allowed(host.as_ref(), &method, origin.as_ref()) {
         error_response(AppError::new(ErrorCode::Forbidden, "origin rejected"))
@@ -375,6 +410,25 @@ fn host_allowed(bound: &SocketAddr, host: Option<&HeaderValue>) -> bool {
         && (host.eq_ignore_ascii_case(&format!("localhost:{port}"))
             || host == format!("127.0.0.1:{port}")
             || host == format!("[::1]:{port}"))
+}
+
+/// 通配监听的 Host 校验：只接受启动时冻结的本机 IPv4 字面量与实际端口。
+///
+/// 不接受 `localhost` 或其他主机名：通配监听覆盖多块网卡，主机名无法证明
+/// 请求来自本机，也必须避免 DNS rebinding 把任意域名解析到本机后通过 Host
+/// 校验。IPv6 也不在此分支：显式通配请求只针对 IPv4（`0.0.0.0`），IPv6 的
+/// 单地址监听仍走 `host_allowed` 的方括号精确匹配。
+fn wildcard_host_allowed(port: u16, allowed: &[Ipv4Addr], host: Option<&HeaderValue>) -> bool {
+    let Some(host) = host.and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    let Ok(address) = host.parse::<SocketAddr>() else {
+        return false;
+    };
+    let SocketAddr::V4(address) = address else {
+        return false;
+    };
+    address.port() == port && allowed.contains(address.ip())
 }
 
 /// 状态变更请求必须与实际 `Host` 精确同源；只有 `GET`/`HEAD` 允许缺少 `Origin`，
@@ -499,6 +553,11 @@ mod tests {
     use super::*;
     use std::net::IpAddr;
 
+    /// 单地址策略的测试入口；封装构造，避免每个断言重复写枚举分支。
+    fn single_allows(bound: &SocketAddr, host: Option<&HeaderValue>) -> bool {
+        HostPolicy::single(*bound).allows(host)
+    }
+
     /// 回环绑定允许 `localhost` 与三种回环写法；端口必须精确匹配，
     /// 否则同一主机上的其他服务端口也能访问本服务。
     #[test]
@@ -506,28 +565,28 @@ mod tests {
         let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         for host in ["127.0.0.1:8080", "localhost:8080", "[::1]:8080"] {
             assert!(
-                host_allowed(&loopback, Some(&HeaderValue::from_static(host))),
+                single_allows(&loopback, Some(&HeaderValue::from_static(host))),
                 "{host}"
             );
         }
         for host in ["127.0.0.1:8081", "localhost:8081", "example.com:8080", ""] {
             let value = HeaderValue::from_str(host).unwrap();
-            assert!(!host_allowed(&loopback, Some(&value)), "{host}");
+            assert!(!single_allows(&loopback, Some(&value)), "{host}");
         }
         // 缺少 Host 头必须拒绝，而不是当成「本机访问」放行。
-        assert!(!host_allowed(&loopback, None));
+        assert!(!single_allows(&loopback, None));
         // Host 是大小写不敏感的 authority：浏览器可能发出 `LOCALHOST:port`，
         // 不能因为逐字比较在第一层就误拒合法请求（同源层本来就按不区分大小写比较）。
-        assert!(host_allowed(
+        assert!(single_allows(
             &loopback,
             Some(&HeaderValue::from_static("LOCALHOST:8080"))
         ));
-        assert!(host_allowed(
+        assert!(single_allows(
             &loopback,
             Some(&HeaderValue::from_static("LocalHost:8080"))
         ));
         // 大小写放宽只针对 `localhost`，不能把其他主机名也变成等价别名。
-        assert!(!host_allowed(
+        assert!(!single_allows(
             &loopback,
             Some(&HeaderValue::from_static("LOCALHOST.LOCAL:8080"))
         ));
@@ -538,13 +597,13 @@ mod tests {
     #[test]
     fn lan_binding_rejects_loopback_aliases() {
         let lan: SocketAddr = "192.168.1.10:8080".parse().unwrap();
-        assert!(host_allowed(
+        assert!(single_allows(
             &lan,
             Some(&HeaderValue::from_static("192.168.1.10:8080"))
         ));
         for host in ["localhost:8080", "127.0.0.1:8080", "[::1]:8080"] {
             let value = HeaderValue::from_str(host).unwrap();
-            assert!(!host_allowed(&lan, Some(&value)), "{host}");
+            assert!(!single_allows(&lan, Some(&value)), "{host}");
         }
     }
 
@@ -556,16 +615,16 @@ mod tests {
     #[test]
     fn ipv6_host_requires_brackets() {
         let bound: SocketAddr = "[::1]:8080".parse().unwrap();
-        assert!(host_allowed(
+        assert!(single_allows(
             &bound,
             Some(&HeaderValue::from_static("[::1]:8080"))
         ));
-        assert!(!host_allowed(
+        assert!(!single_allows(
             &bound,
             Some(&HeaderValue::from_static("::1:8080"))
         ));
         // 端口不一致同样拒绝：方括号不能替代端口校验。
-        assert!(!host_allowed(
+        assert!(!single_allows(
             &bound,
             Some(&HeaderValue::from_static("[::1]:8081"))
         ));
@@ -573,18 +632,79 @@ mod tests {
 
         // 非回环 IPv6（局域网绑定）只接受自身带方括号形式，不接受 localhost。
         let lan: SocketAddr = "[fd00::1]:8080".parse().unwrap();
-        assert!(host_allowed(
+        assert!(single_allows(
             &lan,
             Some(&HeaderValue::from_static("[fd00::1]:8080"))
         ));
-        assert!(!host_allowed(
+        assert!(!single_allows(
             &lan,
             Some(&HeaderValue::from_static("fd00::1:8080"))
         ));
-        assert!(!host_allowed(
+        assert!(!single_allows(
             &lan,
             Some(&HeaderValue::from_static("localhost:8080"))
         ));
+    }
+
+    /// 通配监听只接受启动时冻结的本机 IPv4 与实际端口；`0.0.0.0`、主机名、
+    /// 其他设备地址和错误端口都必须失败，避免把「监听所有网卡」变成放行所有 Host。
+    #[test]
+    fn wildcard_host_accepts_only_frozen_local_ipv4_with_exact_port() {
+        let policy = HostPolicy::wildcard(
+            8080,
+            vec![Ipv4Addr::LOCALHOST, Ipv4Addr::new(192, 168, 1, 10)],
+        );
+        for host in ["192.168.1.10:8080", "127.0.0.1:8080"] {
+            assert!(
+                policy.allows(Some(&HeaderValue::from_static(host))),
+                "{host}"
+            );
+        }
+        for host in [
+            "192.168.1.10:8081",
+            "192.168.1.11:8080",
+            "0.0.0.0:8080",
+            "localhost:8080",
+            "attacker.example:8080",
+            "[::1]:8080",
+            "",
+        ] {
+            let value = HeaderValue::from_str(host).unwrap();
+            assert!(!policy.allows(Some(&value)), "{host}");
+        }
+        // 缺少 Host 头没有可比对的 authority，必须失败关闭。
+        assert!(!policy.allows(None));
+    }
+
+    /// 通配监听的同源校验仍以本次请求的 Host 为准：Origin 必须逐字匹配
+    /// 已通过白名单的 Host，不能用另一块本机网卡或任意域名替代。
+    #[test]
+    fn wildcard_origin_must_match_the_validated_host() {
+        let host = HeaderValue::from_static("192.168.1.10:8080");
+        assert!(
+            HostPolicy::wildcard(
+                8080,
+                vec![Ipv4Addr::LOCALHOST, Ipv4Addr::new(192, 168, 1, 10)]
+            )
+            .allows(Some(&host))
+        );
+        assert!(origin_allowed(
+            Some(&host),
+            &Method::POST,
+            Some(&HeaderValue::from_static("http://192.168.1.10:8080"))
+        ));
+        assert!(!origin_allowed(
+            Some(&host),
+            &Method::POST,
+            Some(&HeaderValue::from_static("http://127.0.0.1:8080"))
+        ));
+        assert!(!origin_allowed(
+            Some(&host),
+            &Method::POST,
+            Some(&HeaderValue::from_static("http://attacker.example:8080"))
+        ));
+        // 状态变更请求缺少 Origin 同样拒绝。
+        assert!(!origin_allowed(Some(&host), &Method::POST, None));
     }
 
     /// 状态变更方法缺少 Origin 一律拒绝；只读方法允许缺少，但存在时同样要精确同源。

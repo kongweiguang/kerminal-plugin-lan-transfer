@@ -48,3 +48,9 @@ pub const STOP_TIMEOUT_SECS: u64 = 5;
 pub const SHUTDOWN_TIMEOUT_SECS: u64 = 1;
 /// 允许绑定的回环地址也保留，但界面默认选择第一个非回环 IPv4。
 pub const LOOPBACK_HINT: &str = "127.0.0.1";
+/// 显式全接口 IPv4 监听值。
+///
+/// 它只作为绑定语义存在：链接、二维码与面板展示必须使用具体的本机 IPv4，
+/// 否则对端会拿到一个无法打开的 `0.0.0.0` 地址。单独定义常量是为了让
+/// 状态校验、Host 白名单和视图文案对同一个字符串达成一致。
+pub const WILDCARD_ADDRESS: &str = "0.0.0.0";

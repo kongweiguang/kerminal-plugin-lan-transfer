@@ -6,18 +6,19 @@ Kerminal 外部插件（Rust Sidecar）：在本机选择一个共享目录，�
 
 ## 能力
 
-- 面板内选择共享目录与本机监听地址，启动后由系统分配端口，生成带高熵密钥的访问链接与二维码。
+- 面板可选择共享目录和监听地址。支持动态下拉的宿主会列出 IP 和网卡名，另外提供「127.0.0.1 · 仅本机」和「0.0.0.0 · 所有 IPv4 网卡」。旧宿主可在输入框填写同样的地址。启动后由系统分配端口，生成带高熵密钥的访问链接与二维码。选择所有 IPv4 网卡时，链接和二维码使用具体的本机 IPv4。
 - 浏览器打开链接后，用 URL 片段里的密钥配对，换取短期 Bearer 令牌；片段随即从历史记录中移除。
 - 目录浏览、单文件上传（同名自动改名，不覆盖）、单文件下载（短期票据 URL，浏览器原生下载与进度）。
-- 原生面板将目录和监听地址放在同一个分组。目录为空时禁用启动，停止入口仅在运行、停止中或仍需回收句柄时出现。运行后显示实际共享目录、监听地址、访问范围、复制入口、二维码和传输计数。Windows 盘符和 UNC 目录以常用形式显示，持久化仍使用原始路径。动作错误显示在安全提醒前，输入校验失败保留当前阶段。面板用 `x-kerminal-appearance` 声明外观，用 `x-kerminal-action-error` 合并重复提示，用 `x-kerminal-requires-text` 在界面即时判断启动按钮是否可用。旧宿主可继续加载视图，Sidecar 仍校验动作参数。
+- 原生面板将目录和监听地址放在同一个分组。目录为空时禁用启动，停止入口仅在运行、停止中或仍需回收句柄时出现。运行后显示实际共享目录、监听地址、访问范围、复制入口、二维码和传输计数。Windows 盘符和 UNC 目录以常用形式显示，持久化仍使用原始路径。动作错误显示在安全提醒前，输入校验失败保留当前阶段。面板用 `x-kerminal-appearance` 声明外观，用 `x-kerminal-action-error` 合并重复提示，用 `x-kerminal-requires-text` 在界面即时判断启动按钮是否可用；地址下拉用 `x-kerminal-select-options` 声明选项，旧宿主忽略该扩展。旧宿主可继续加载视图，Sidecar 仍校验动作参数。
 - 「复制链接」通过宿主 `clipboard.write` 写入系统剪贴板。宿主确认写入且共享链接仍然有效时，只有发起窗口的按钮会切换为「已复制」，二维码位置不变。如果等待确认期间共享已停止或重新启动，面板会提示复制未完成，剪贴板可能仍含旧链接。写入失败会保留宿主返回的错误。
 
 ## 安全边界（必须了解）
 
 - **HTTP 明文传输**：链路不加密，同一局域网内的人可能看到文件内容与会话数据。只在可信网络使用。
-- 服务只监听用户选择的本机地址，端口由系统分配；只服务所选目录及其安全子目录，不跟随链接与 Windows 重解析点，隐藏项与内部暂存文件不可见、不可写。名字无法通过路径段规则表达的条目（例如 Linux 上的 `a:b.txt`、尾空格）会被整条隐藏，列表不会为它们生成空 id。
+- 服务只监听用户选择的本机地址（或用户显式选择的 `0.0.0.0`），端口由系统分配；只服务所选目录及其安全子目录，不跟随链接与 Windows 重解析点，隐藏项与内部暂存文件不可见、不可写。名字无法通过路径段规则表达的条目（例如 Linux 上的 `a:b.txt`、尾空格）会被整条隐藏，列表不会为它们生成空 id。
 - 所有响应带 `Content-Security-Policy: frame-ancestors 'none'`、`X-Frame-Options: DENY`、`nosniff`、`no-referrer`、`no-store`。
-- 所有非 `GET`/`HEAD` 请求由同一层中间件要求与本次请求的 `Host` 精确同源（`Host: 127.0.0.1:P` 配 `Origin: http://localhost:P` 视为跨源而拒绝）；`Host` 必须精确匹配当前监听地址（含端口），IPv6 只接受 `[ip]:port`，`localhost` 按大小写不敏感比较。`GET`/`HEAD` 允许缺少 `Origin`（浏览器原生下载不带），但存在时同样校验。
+- 所有非 `GET`/`HEAD` 请求由同一层中间件要求与本次请求的 `Host` 精确同源（`Host: 127.0.0.1:P` 配 `Origin: http://localhost:P` 视为跨源而拒绝）；`Host` 必须精确匹配当前监听地址（含端口；通配监听见下条），IPv6 只接受 `[ip]:port`，`localhost` 按大小写不敏感比较。`GET`/`HEAD` 允许缺少 `Origin`（浏览器原生下载不带），但存在时同样校验。
+- 通配监听（`0.0.0.0`）不把 `0.0.0.0` 当作可访问主机名：启动时冻结当时本机真实 IPv4 集合，请求 `Host` 必须是集合中的某个 IPv4 加实际端口，`0.0.0.0`、`localhost`、IPv6 与其他主机名一律拒绝；`Origin` 仍必须与本次请求 `Host` 精确同源。链接与二维码使用排序后的具体本机 IPv4（优先非回环地址，找不到时回退 `127.0.0.1`），面板会标明链接所用地址，并提示通配监听包含 VPN/虚拟网卡、实际可达性还取决于防火墙。
 - 文件名只来自查询串，按同一套路径段规则校验，绝不参与拼接绝对路径；`CON`、`a/b`、`.hidden`、暂存前缀等一律拒绝。
 - 上传先写内部暂存文件，刷盘后才以「不覆盖」方式改名提交；提交失败不谎称成功，也不自动重试。
 - 下载票据绑定单个文件与当前服务代次，过期或服务重启即失效，且不能用于其他接口。下载响应声明 `Accept-Ranges: bytes` 并支持标准单区间 `Range`（`bytes=start-end`、`bytes=start-`、`bytes=-suffix`，返回 206 与 `Content-Range`；起点越界返回 416 与 `bytes */size`；语法非法或多区间按 RFC 忽略并整份返回 200）。只承诺单次请求内的浏览器续传兼容，不承诺跨会话断点续传；票据失效后需重新获取票据从头下载。
@@ -88,6 +89,8 @@ python -I tests/sidecar_http_e2e.py --sidecar .kerminal/build/bin/kerminal-plugi
 
 2026-11-20 本轮面板布局与 RPC 回执改动后复跑 `cargo +1.98.0 test --locked`（隔离 `CARGO_TARGET_DIR=target-check`）为 129 个测试（76 个库测试、29 个 HTTP 契约、6 个 Origin 契约、6 个 RPC 握手、12 个视图数据）全部通过；`rustfmt --edition 2024 --check` 对改动文件通过；用本轮 debug Sidecar 运行 `python -I tests/sidecar_http_e2e.py --sidecar target-check/debug/kerminal-plugin-sidecar.exe` 为 7/7 通过，新增的真实子进程场景用协议内假宿主 ACK/拒绝 `clipboard.write`（不触碰系统剪贴板），验证未运行时拒绝复制、宿主拒绝时不出现确认、只有 ACK 后才切换按钮文案且不广播。SDK CLI `check` 对按当前 `resources/` 与 debug Sidecar 组装的独立临时包（未复用 `.kerminal/build`）返回 0；Windows 11 的隔离原生窗口在 1440×900、150% DPI 下覆盖浅色、深色与跟随系统，验证空目录禁用启动、无效目录反馈、修正后回环启动、复制与二维码显示、停止后清除链接和退出。使用本轮 debug 宿主和独立插件包。`v0.1.2` 发布前复跑了 Windows release 构建、包校验与 `conformance`，均通过。对 release Sidecar 的脚本运行 8/8 通过，包含跨窗口停止共享后才收到剪贴板确认的回归。
 
+2026-11-22 本轮地址下拉与显式全接口 IPv4 改动后，在 Windows 11（`x86_64-pc-windows-msvc`，Rust 1.98.0）以隔离 `CARGO_TARGET_DIR=target-check` 复跑 `cargo +1.98.0 test --locked`：144 个测试（85 个库测试、32 个 HTTP 契约、6 个 Origin 契约、7 个 RPC 握手、14 个视图数据）全部通过，0 失败、0 忽略。新增用例覆盖通配选择的显式性与停止/重试保留、旧草稿不自动恢复、通配链接使用具体 IPv4、Host 只接受冻结的本机 IPv4 与实际端口、Origin 精确同源，以及回环监听上的真实 HTTP 配对/拒绝分支。视图数据用例同时校验地址下拉的 `x-kerminal-select-options` 绑定、短提示与通配说明；地址占位改为中性的「本机 IP 地址 / Local IP address」，不再显示虚构网段。用工作区 `.kerminal-sdk` 的 debug CLI（SDK HEAD `40d2764045c72ce55a593b8974a0e6624f2ae050`，与上面固定的发布提交不同）执行 `kerminal-plugin build --platform windows-x86_64` 成功，`check .kerminal/build` 通过；再用独立临时输出目录执行 `package`，归档 `check` 也通过（`kongweiguang.lan-transfer 0.1.2`）。这次构建只证明当前源码在现有 SDK 下可构建和打包，发布前仍应按固定 SDK 提交复跑。未运行 GUI、未做真实局域网跨设备验收；通配测试只在进程内短暂绑定 `0.0.0.0` 生成链接后立即停止。
+
 ## 发布
 
 在[插件源码仓库](https://github.com/kongweiguang/kerminal-plugin-lan-transfer)推送与清单版本匹配的 `v*` 标签后，GitHub Actions 使用 `KERMINAL_SDK_REF` 固定的 SDK 提交构建 Windows x64、Linux x64、macOS Intel 和 macOS Apple Silicon 的 `.kplugin`。四个平台的包全部通过校验、上传并回读比对后，工作流才公开 Release。SDK 的配置方法见上面的构建说明。
@@ -99,6 +102,8 @@ python -I tests/sidecar_http_e2e.py --sidecar .kerminal/build/bin/kerminal-plugi
 - 原生二维码已在 Windows 调试宿主渲染验证。扫码跨设备访问、系统目录选择器、系统剪贴板与宿主安装仍需单独验收。
 - 清单声明 `api: ">=1.1.0 <2.0.0"`，当前宿主权威常量 `HOST_API_VERSION` 为 `1.1.0`（`crates/application/src/plugins.rs`），因此该范围与当前宿主兼容；宿主在安装、启动与贡献注册三处都用同一套 npm 范围语义校验 `manifest.api`，更旧的 1.0 宿主仍会拒绝加载。此结论来自宿主源码与测试，不是本轮桌面安装验收。
 - 真实浏览器反嵌入、真实局域网与 macOS/Linux 原生运行未验收；Windows 无目录 fsync，不对崩溃后的目录项持久性作承诺。
+- 通配监听覆盖启动时可见的所有 IPv4 网卡（含 VPN、虚拟网卡与其他可路由接口）；每次启动都会重新枚举网卡，面板空闲期间发生的网络变化会在下一次启动时同时反映到链接、二维码与 Host 白名单。白名单在同一服务生命周期内冻结，启动后新增或变更的网卡地址需要重启服务才会被接受。用户显式选择 `0.0.0.0` 后，停止或失败重试会保留该选择；宿主保存的旧草稿不会在新进程中自动恢复通配监听。旧宿主仍使用地址输入框，输入 `0.0.0.0` 会进入同一套通配逻辑，并获得具体 IPv4 链接与面板提示。
+- 具体地址下拉在插件进程启动时读取网卡地址。连接新的 Wi‑Fi 或 VPN 后，重启 Kerminal 可刷新选项。
 - 共享目录当前需要创建权限：只读 ACL（缺少创建文件/子目录权限）的目录无法作为可读共享目录打开；本轮不修改权限模型。
 - 超长文件名没有空间追加自动改名后缀时，同名上传可能以 409 失败（仍不覆盖）；本轮不修改名字策略。
 - 目录条目超过 `MAX_DIR_ENTRIES`（20000）时列举会返回 `too_large` 而不是截断；恰好上限仍接受、超过一条即失败这一边界由纯函数回归固定，但尚未用真实两万条目目录做端到端验证。

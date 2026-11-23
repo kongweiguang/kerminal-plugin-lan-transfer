@@ -20,7 +20,7 @@
 //! Windows 上没有目录 fsync，这里不承诺崩溃后的目录项持久性。
 
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -348,8 +348,8 @@ impl Controller {
     /// 若这里忽略它，服务会按旧地址绑定，界面显示与实际监听不一致——用户可能以为
     /// 只共享给了回环，实际却绑到了局域网地址。
     ///
-    /// 地址校验与绑定在同一段生命周期临界区内完成，因此并发的 `set-address`
-    /// 不会插到「校验通过」与「实际绑定」之间。地址无效时明确失败，绝不回退旧地址。
+    /// 地址校验和进入启动态在同一状态锁内完成，防止其他面板覆盖本次请求。
+    /// 地址无效时保留原状态，避免用户误以为服务正在按这次选择启动。
     pub async fn start_with_address(
         &self,
         root_path: PathBuf,
@@ -360,12 +360,7 @@ impl Controller {
         // 地址无效的启动请求会把面板显示的共享根改成新路径，而实际监听仍绑定
         // 旧目录句柄——用户看到「已共享 B」，文件却来自 A。只有 `begin_start`
         // 真正准入后才记录，失败或忙的请求不再产生可见副作用。
-        if let Some(address) = address {
-            // 状态为 Idle/Failed 时才可能走到这里；运行中改地址会被拒绝，
-            // 这正是「运行中地址不可变」的保证，不需要额外判断。
-            self.state.select_address(address)?;
-        }
-        let ip = self.state.begin_start()?;
+        let ip = self.state.begin_start_with_address(address)?;
         self.state.remember_root(&root_path);
         // 取消守卫：SDK 可以在 `view.action` 中途取消并直接 drop future，此时下面的
         // `Err` 分支不会执行，状态会永久停在「正在启动…」。守卫在 drop 时把仍为
@@ -474,7 +469,25 @@ impl Controller {
         let bound = listener
             .local_addr()
             .map_err(|_| AppError::new(ErrorCode::Server, "local address unavailable"))?;
-        let link = format!("http://{bound}/#{secret}");
+        // 通配监听（0.0.0.0）不能把绑定地址直接写进链接：浏览器无法打开
+        // `http://0.0.0.0:port`。这里在真正启动时重新枚举一次网卡，用同一份样本
+        // 挑选具体 IPv4 生成链接与二维码，并冻结成 Host 白名单。面板创建后网络
+        // 可能已经变化，沿用创建时的旧列表会生成打不开的链接；白名单随后固定，
+        // 运行中换网卡需要重启服务。单地址监听保持原有逐字校验，不因为引入通配
+        // 分支而放宽任何具体地址的 Host/Origin 检查。
+        let (advertised, hosts) = if ip == IpAddr::V4(Ipv4Addr::UNSPECIFIED) {
+            let addresses = crate::net::list_addresses();
+            let ipv4 = crate::net::advertised_ipv4(&addresses);
+            let allowed = crate::net::ipv4_allowlist(&addresses);
+            let advertised = SocketAddr::new(IpAddr::V4(ipv4), bound.port());
+            (
+                advertised,
+                crate::http::HostPolicy::wildcard(bound.port(), allowed),
+            )
+        } else {
+            (bound, crate::http::HostPolicy::single(bound))
+        };
+        let link = format!("http://{advertised}/#{secret}");
         let qr = render_qr(&link)?;
         // 统计通道由控制器持有，跨代共享：每次上传/下载完成只递增修订号，
         // 视图推送任务（首个 `view.open` 启动）订阅并刷新面板。
@@ -485,7 +498,7 @@ impl Controller {
             sessions: sessions.clone(),
             tickets: tickets.clone(),
             root,
-            bound,
+            hosts,
             run: run.clone(),
             stats,
             uploads: std::sync::atomic::AtomicUsize::new(0),
@@ -517,9 +530,9 @@ impl Controller {
         if let Some(detail) = finished {
             return Err(AppError::new(ErrorCode::Server, detail));
         }
-        if let Err(error) = self
-            .state
-            .mark_running(bound, link.clone(), root_label, qr, expires_at)
+        if let Err(error) =
+            self.state
+                .mark_running(advertised, link.clone(), root_label, qr, expires_at)
         {
             // 状态写入失败时不能让已经启动的监听任务脱离管理：守卫 drop 时会撤销
             // 会话、请求关闭并中止任务。
@@ -1016,6 +1029,49 @@ mod tests {
         assert!(snapshot.error.is_some());
         assert!(snapshot.address.is_none() && snapshot.link.is_none());
         assert_eq!(snapshot.root_path.as_deref(), missing.to_str());
+        assert!(controller.shutdown().await);
+    }
+
+    /// 通配启动必须把具体本机 IPv4 写进链接与展示地址，绝不能把 `0.0.0.0`
+    /// 交给对端；停止与重试仍保留用户显式选择的通配值，但每次重新生成链接。
+    #[tokio::test]
+    async fn wildcard_start_uses_concrete_link_and_survives_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let share = root.path().join("share");
+        std::fs::create_dir(&share).unwrap();
+        let controller = Controller::new();
+        // 显式选择通配地址；默认值不能自动变成通配。
+        controller.state.select_address("0.0.0.0").unwrap();
+        let link = controller.start(share.clone()).await.unwrap();
+        let snapshot = controller.state.snapshot().unwrap();
+        assert_eq!(snapshot.phase, crate::state::Phase::Running);
+        assert_eq!(snapshot.selected_address, "0.0.0.0");
+        assert!(snapshot.qr.is_some());
+        let authority = link
+            .strip_prefix("http://")
+            .and_then(|link| link.split('/').next())
+            .expect("link authority");
+        let host = authority.rsplit_once(':').map(|(host, _)| host).unwrap();
+        // 链接必须使用真实可打开的具体地址，通配语义只存在于绑定层。
+        assert_ne!(host, "0.0.0.0", "link must not expose the wildcard address");
+        assert_eq!(snapshot.address.as_deref(), Some(authority));
+
+        controller.stop().await.unwrap();
+        assert_eq!(
+            controller.state.snapshot().unwrap().selected_address,
+            "0.0.0.0",
+            "stop must keep the explicit wildcard selection for retry"
+        );
+        let second = controller.start(share).await.unwrap();
+        // 不比较密钥原文；完整链接不同只输出固定说明，避免把一次性密钥带进日志。
+        assert!(second != link, "restart must issue a new link");
+        let snapshot = controller.state.snapshot().unwrap();
+        assert_eq!(snapshot.selected_address, "0.0.0.0");
+        let authority = second
+            .strip_prefix("http://")
+            .and_then(|link| link.split('/').next())
+            .expect("second link authority");
+        assert_eq!(snapshot.address.as_deref(), Some(authority));
         assert!(controller.shutdown().await);
     }
 

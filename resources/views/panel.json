@@ -4,7 +4,8 @@
     "root_path": "",
     "shared_path": null,
     "selected_address": "",
-    "addresses_hint": "127.0.0.1 is local only",
+    "address_options": [],
+    "addresses_hint": "0.0.0.0 includes VPN and virtual adapters.",
     "running": false,
     "starting": false,
     "stopping": false,
@@ -14,6 +15,8 @@
     "can_stop": false,
     "address": null,
     "scope": "",
+    "wildcard": false,
+    "address_note": "",
     "link": null,
     "root_name": null,
     "qr": null,
@@ -92,7 +95,8 @@
               "bind": "selected_address",
               "label": "%field.address%",
               "placeholder": "%placeholder.address%",
-              "on_submit": "set-address"
+              "on_submit": "set-address",
+              "x-kerminal-select-options": "$address_options"
             },
             {
               "type": "text",
@@ -128,6 +132,13 @@
               "x-kerminal-appearance": "caption",
               "text": "$scope",
               "tone": "muted"
+            },
+            {
+              "type": "text",
+              "x-kerminal-appearance": "caption",
+              "text": "$address_note",
+              "tone": "muted",
+              "visible": "$wildcard"
             },
             {
               "type": "button",

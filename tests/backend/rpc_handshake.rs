@@ -147,6 +147,8 @@ async fn handshake_serves_view_methods_and_shutdown_reclaims() {
     // 视图数据必须带阶段布尔量与计数文案，否则面板打开就是空白。
     assert_eq!(reply["result"]["data"]["running"], false);
     assert!(reply["result"]["data"]["stats"].is_string());
+    // 新宿主据此渲染地址下拉；旧宿主忽略扩展，不影响原有输入框。
+    assert!(reply["result"]["data"]["address_options"].is_array());
 
     // 动作在停止状态下不能静默成功：空目录是字段类型正确的输入错误，走私有
     // 输入码；同一本地化文案同时进入业务错误与视图数据，宿主据此只显示一次。
@@ -455,6 +457,105 @@ async fn start_keeps_directory_path_verbatim() {
     send(
         &mut write,
         json!({"jsonrpc":"2.0","id":"h:3","method":"shutdown","params":{}}),
+    )
+    .await;
+    receive(&mut read).await;
+    assert!(task.await.unwrap().is_ok());
+}
+
+/// 通配地址必须由本运行期的显式动作选定：宿主旧草稿不能自动切换，
+/// 显式 `set-address` 后快照与后续打开都保持一致。
+#[tokio::test]
+async fn wildcard_requires_explicit_selection_and_stays_in_runtime() {
+    let controller = Controller::new();
+    let (host, plugin) = tokio::io::duplex(16 * 1024);
+    let (plugin_read, plugin_write) = tokio::io::split(plugin);
+    let task = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        async move { serve(&controller, plugin_read, plugin_write).await }
+    });
+    let (read, mut write) = tokio::io::split(host);
+    let mut read = BufReader::new(read);
+    send(&mut write, initialize("h:1")).await;
+    receive(&mut read).await;
+
+    // 旧草稿里的通配值不能把新运行期自动切到全接口；下拉仍应提供该选项。
+    send(
+        &mut write,
+        json!({
+            "jsonrpc":"2.0",
+            "id":"h:2",
+            "method":"view.open",
+            "params":{
+                "view":"lan.transfer.panel",
+                "instance":"w1",
+                "scope":{},
+                "state":{"selected_address":"0.0.0.0"}
+            }
+        }),
+    )
+    .await;
+    let opened = receive(&mut read).await;
+    assert!(opened["error"].is_null(), "{opened}");
+    let data = &opened["result"]["data"];
+    assert_ne!(
+        data["selected_address"], "0.0.0.0",
+        "stale wildcard must not be restored automatically"
+    );
+    let options = data["address_options"].as_array().unwrap();
+    assert!(options.iter().any(|option| option["value"] == "0.0.0.0"));
+    assert!(options.iter().any(|option| option["value"] == "127.0.0.1"));
+
+    // 用户显式提交通配地址后才写入本次运行状态。
+    send(
+        &mut write,
+        json!({
+            "jsonrpc":"2.0",
+            "id":"h:3",
+            "method":"view.action",
+            "params":{
+                "instance":"w1",
+                "action":"set-address",
+                "data":{"selected_address":"0.0.0.0"}
+            }
+        }),
+    )
+    .await;
+    let reply = receive(&mut read).await;
+    assert!(reply["error"].is_null(), "{reply}");
+    assert_eq!(reply["result"]["patch"]["selected_address"], "0.0.0.0");
+
+    // 快照是宿主恢复草稿的来源；本次运行期选过通配后应如实返回。
+    send(
+        &mut write,
+        json!({"jsonrpc":"2.0","id":"h:4","method":"view.snapshot","params":{}}),
+    )
+    .await;
+    let snapshot = receive(&mut read).await;
+    assert_eq!(snapshot["result"]["state"]["selected_address"], "0.0.0.0");
+
+    // 同一运行期再次打开视图时，通配值应保持而不是被默认地址覆盖。
+    send(
+        &mut write,
+        json!({
+            "jsonrpc":"2.0",
+            "id":"h:5",
+            "method":"view.open",
+            "params":{
+                "view":"lan.transfer.panel",
+                "instance":"w2",
+                "scope":{},
+                "state":{"selected_address":"0.0.0.0"}
+            }
+        }),
+    )
+    .await;
+    let reopened = receive(&mut read).await;
+    assert_eq!(reopened["result"]["data"]["selected_address"], "0.0.0.0");
+
+    send(
+        &mut write,
+        json!({"jsonrpc":"2.0","id":"h:6","method":"shutdown","params":{}}),
     )
     .await;
     receive(&mut read).await;

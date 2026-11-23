@@ -5,14 +5,16 @@
 //! 当作唯一状态源。所有转换都在同一把锁内完成，避免「停止中又被启动」这类交叉。
 
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
 };
 
 use serde::Serialize;
 
 use crate::{
+    config::WILDCARD_ADDRESS,
     error::{AppResult, ErrorCode},
+    l10n::{Key, Locale},
     net::ListenAddress,
     secret::now_unix,
 };
@@ -27,6 +29,16 @@ pub enum Phase {
     Running,
     Stopping,
     Failed,
+}
+
+/// 视图地址下拉中的一个选项。
+///
+/// `value` 会写回 `selected_address`，因此必须是可解析的监听值；`label` 只负责
+/// 让用户辨认网卡与用途，可包含接口名或本地化说明，不参与任何校验。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AddressOption {
+    pub label: String,
+    pub value: String,
 }
 
 /// 对外快照；字段名即视图绑定名，增删字段需同步视图文件与状态版本。
@@ -47,6 +59,8 @@ pub struct Snapshot {
     /// 已选监听地址的文本形式，供输入框绑定。
     pub selected_address: String,
     pub addresses: Vec<String>,
+    /// 下拉选项；包含具体本机地址、回环与显式全接口 IPv4。
+    pub address_options: Vec<AddressOption>,
     /// 可直接展示的状态行与错误行（已本地化）。
     pub status: String,
     pub error: Option<String>,
@@ -79,7 +93,9 @@ struct Inner {
 }
 
 impl State {
-    /// 初始化状态；地址列表在启动时枚举一次，避免每次刷新都触发网卡枚举。
+    /// 初始化状态；地址列表在状态创建时枚举一次，供下拉选项与具体地址校验
+    /// 使用，避免每次刷新都触发网卡枚举。通配启动不依赖这份列表：`service`
+    /// 会在真正绑定时重新采样，让链接与 Host 白名单反映当时的网络。
     pub fn new() -> Arc<Self> {
         let addresses = crate::net::list_addresses();
         let selected = addresses
@@ -124,6 +140,7 @@ impl State {
                 .iter()
                 .map(|address| address.ip.to_string())
                 .collect(),
+            address_options: address_options(&inner.addresses),
             status: status_text(inner.phase).to_owned(),
             error: inner.error.clone(),
             uploaded: inner.uploaded,
@@ -138,29 +155,21 @@ impl State {
     ///
     /// 地址文本是用户输入的 IP，前后空白没有语义（与目录路径不同），因此这里
     /// 去掉空白后再校验并保存；`start` 从动作快照读取地址时也做同样处理。
+    /// 显式 `0.0.0.0` 是允许的全接口 IPv4 请求；其他不属于本机的地址仍拒绝。
     pub fn select_address(&self, value: &str) -> AppResult<()> {
         let mut inner = self.lock()?;
-        if matches!(
-            inner.phase,
-            Phase::Starting | Phase::Running | Phase::Stopping
-        ) {
-            return Err(crate::error::AppError::new(ErrorCode::Busy, "service busy"));
-        }
-        let value = value.trim();
-        let parsed = value
-            .parse::<std::net::IpAddr>()
-            .map_err(|_| crate::error::AppError::new(ErrorCode::BadRequest, "invalid address"))?;
-        if !inner.addresses.iter().any(|address| address.ip == parsed) {
-            return Err(crate::error::AppError::new(
-                ErrorCode::BadRequest,
-                "address not on this host",
-            ));
-        }
-        inner.selected_address = value.to_owned();
-        // 不在这里清 `error`：失败说明通常指向目录或绑定原因，用户只是修正地址
-        // 时不应该把原失败原因抹掉，否则面板会只剩「操作失败」而没有任何依据。
-        // 下一次启动会由 `begin_start` 清空旧错误并生成新的结果。
-        Ok(())
+        apply_address(&mut inner, value, false)
+    }
+
+    /// 从宿主保存的视图状态恢复地址选择。
+    ///
+    /// 与用户动作不同，宿主持久化的草稿可能来自上一进程。全接口监听会显著扩大
+    /// 暴露范围，因此不能因为草稿里有 `0.0.0.0` 就在新运行期自动选中；只有本次
+    /// 运行期已经由用户显式选过通配地址时才接受同值恢复。具体地址仍按原规则
+    /// 校验，失效或非本机地址会被忽略而不影响视图打开。
+    pub fn restore_address(&self, value: &str) -> AppResult<()> {
+        let mut inner = self.lock()?;
+        apply_address(&mut inner, value, true)
     }
 
     /// 记录本次尝试的共享目录。即使启动失败也保留：用户更可能需要修正刚才那条路径，
@@ -188,11 +197,19 @@ impl State {
         true
     }
 
-    /// 进入启动中；返回选中的地址供绑定。
-    pub fn begin_start(&self) -> AppResult<std::net::IpAddr> {
+    /// 无显式地址的调用沿用当前选择，避免测试或内部调用需要复制默认值逻辑。
+    pub fn begin_start(&self) -> AppResult<IpAddr> {
+        self.begin_start_with_address(None)
+    }
+
+    /// 地址校验和进入启动态共享状态锁，避免其他窗口的旧草稿覆盖本次启动选择。
+    pub(crate) fn begin_start_with_address(&self, address: Option<&str>) -> AppResult<IpAddr> {
         let mut inner = self.lock()?;
         if !matches!(inner.phase, Phase::Idle | Phase::Failed) {
             return Err(crate::error::AppError::new(ErrorCode::Busy, "service busy"));
+        }
+        if let Some(address) = address {
+            apply_address(&mut inner, address, false)?;
         }
         let ip = inner
             .selected_address
@@ -379,6 +396,73 @@ impl State {
     }
 }
 
+/// 校验并写入选中地址；`restoring` 区分用户显式动作与宿主保存草稿的恢复。
+///
+/// 两者共用同一套本机地址校验，避免恢复路径绕过「不属于本机」检查。差异只在
+/// 通配地址：宿主草稿不能把新运行期自动切到全接口；用户在本运行期已经显式
+/// 选过时，恢复同值只是幂等确认。
+fn apply_address(inner: &mut Inner, value: &str, restoring: bool) -> AppResult<()> {
+    if matches!(
+        inner.phase,
+        Phase::Starting | Phase::Running | Phase::Stopping
+    ) {
+        return Err(crate::error::AppError::new(ErrorCode::Busy, "service busy"));
+    }
+    let value = value.trim();
+    let parsed = value
+        .parse::<IpAddr>()
+        .map_err(|_| crate::error::AppError::new(ErrorCode::BadRequest, "invalid address"))?;
+    let wildcard = parsed == IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    if wildcard && restoring && inner.selected_address != WILDCARD_ADDRESS {
+        // 不做任何提示：宿主草稿只是历史输入，不是用户此刻的动作；视图仍显示
+        // 当前具体地址，用户需要全接口时必须重新选择或输入。
+        return Ok(());
+    }
+    if !wildcard && !inner.addresses.iter().any(|address| address.ip == parsed) {
+        return Err(crate::error::AppError::new(
+            ErrorCode::BadRequest,
+            "address not on this host",
+        ));
+    }
+    inner.selected_address = parsed.to_string();
+    // 不在这里清 `error`：失败说明通常指向目录或绑定原因，用户只是修正地址
+    // 时不应该把原失败原因抹掉，否则面板会只剩「操作失败」而没有任何依据。
+    // 下一次启动会由 `begin_start` 清空旧错误并生成新的结果。
+    Ok(())
+}
+
+/// 生成视图下拉选项：具体地址在前，回环与显式全接口 IPv4 依次在后。
+///
+/// 接口名能让用户在多个网卡之间辨认用途；回环与通配地址使用本地化说明，
+/// 因为它们是固定的语义选项，而不是某块网卡的名字。通配地址始终排在最后，
+/// 避免成为默认项，也避免把「监听所有网卡」混进普通本机地址列表中间。
+fn address_options(addresses: &[ListenAddress]) -> Vec<AddressOption> {
+    let locale = Locale::detect();
+    let mut options = addresses
+        .iter()
+        .map(|address| {
+            let label = match address.ip {
+                IpAddr::V4(ip) if ip.is_loopback() => {
+                    locale.text(Key::AddressOptionLoopback).to_owned()
+                }
+                _ if !address.label.is_empty() && address.label != "loopback" => {
+                    format!("{} · {}", address.ip, address.label)
+                }
+                _ => address.ip.to_string(),
+            };
+            AddressOption {
+                label,
+                value: address.ip.to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
+    options.push(AddressOption {
+        label: locale.text(Key::AddressOptionAllInterfaces).to_owned(),
+        value: WILDCARD_ADDRESS.to_owned(),
+    });
+    options
+}
+
 /// 状态行文案；与 `l10n::Key` 保持同一套措辞。
 fn status_text(phase: Phase) -> &'static str {
     let locale = crate::l10n::Locale::detect();
@@ -486,6 +570,84 @@ mod tests {
         let snapshot = state.snapshot().unwrap();
         assert_eq!(snapshot.phase, Phase::Failed);
         assert_eq!(snapshot.error.as_deref(), Some("无法绑定该地址与端口"));
+    }
+
+    /// 显式全接口选择必须在本运行期的失败重试与停止后保留；否则用户每次
+    /// 重试都要重新打开下拉，且可能误以为服务已退回某个具体地址。
+    #[test]
+    fn wildcard_selection_survives_failed_retry_and_stop() {
+        let state = State::new();
+        state.select_address("0.0.0.0").unwrap();
+        assert_eq!(
+            state.begin_start().unwrap(),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+        state.mark_failed("bind failed".into()).unwrap();
+        assert_eq!(
+            state.begin_start().unwrap(),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            "failure retry must keep the explicit wildcard request"
+        );
+        state.begin_stop(true).unwrap();
+        state.mark_idle().unwrap();
+        let snapshot = state.snapshot().unwrap();
+        assert_eq!(snapshot.selected_address, "0.0.0.0");
+        // 链接与 Host 白名单现在由启动时的同一次网卡样本生成，相关断言在
+        // `service` 与 `net` 的测试里覆盖；这里只关心选择本身是否被保留。
+    }
+
+    /// 宿主保存的旧草稿不能把新运行期自动切到全接口；只有本运行期已显式
+    /// 选择过通配地址时，恢复同值才是允许的幂等操作。
+    #[test]
+    fn stale_wildcard_is_not_restored_without_explicit_selection() {
+        let state = State::new();
+        let before = state.snapshot().unwrap().selected_address;
+        assert_ne!(before, "0.0.0.0", "default must stay concrete");
+        state.restore_address("0.0.0.0").unwrap();
+        assert_eq!(state.snapshot().unwrap().selected_address, before);
+
+        state.select_address("0.0.0.0").unwrap();
+        state.restore_address("0.0.0.0").unwrap();
+        assert_eq!(state.snapshot().unwrap().selected_address, "0.0.0.0");
+
+        // 恢复路径仍拒绝不属于本机的具体地址；视图打开会忽略该错误。
+        assert!(state.restore_address("203.0.113.9").is_err());
+    }
+
+    /// 启动一旦采纳动作地址，其他窗口的选择或恢复都不得改写本次绑定范围。
+    #[test]
+    fn start_pins_the_action_address_until_the_phase_changes() {
+        let state = idle();
+        let ip = state.begin_start_with_address(Some("0.0.0.0")).unwrap();
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(
+            state.select_address("127.0.0.1").unwrap_err().code,
+            ErrorCode::Busy
+        );
+        assert_eq!(
+            state.restore_address("127.0.0.1").unwrap_err().code,
+            ErrorCode::Busy
+        );
+        assert_eq!(state.snapshot().unwrap().selected_address, "0.0.0.0");
+    }
+
+    /// 下拉标签必须注明具体 IP 和回环范围；通配放在末尾，避免默认扩大监听范围。
+    #[test]
+    fn address_options_include_loopback_and_wildcard_last() {
+        let state = idle();
+        let options = state.snapshot().unwrap().address_options;
+        assert!(!options.is_empty());
+        assert!(options.iter().all(|option| !option.label.is_empty()));
+        assert_eq!(
+            options.last().map(|option| option.value.as_str()),
+            Some("0.0.0.0")
+        );
+        let loopback = options
+            .iter()
+            .find(|option| option.value == "127.0.0.1")
+            .expect("loopback option");
+        assert!(loopback.label.contains("127.0.0.1"));
+        assert!(options.last().unwrap().label.contains("IPv4"));
     }
 
     /// 停止后必须清空链接、二维码、地址与时间戳；统计保留用于回看本次会话。

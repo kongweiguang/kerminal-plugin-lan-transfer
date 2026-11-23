@@ -4,7 +4,10 @@
 //! 这些测试直接驱动真实路由（不启动监听），因此能覆盖中间件顺序与响应头，
 //! 而不依赖真实浏览器；真实浏览器与真实局域网验收另行记录。
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 
 use axum::{
     body::Body,
@@ -13,12 +16,13 @@ use axum::{
 use http_body_util::BodyExt;
 use kerminal_plugin_lan_transfer::{
     fs_root::ShareRoot,
-    http::{AppContext, RunHandle, router},
+    http::{AppContext, HostPolicy, RunHandle, router},
     session::Sessions,
     state::State,
     ticket::Tickets,
 };
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
 /// 测试夹具：独立临时共享根 + 已标记运行的状态，绝不触碰真实配置或用户目录。
@@ -35,11 +39,32 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        let bound: SocketAddr = "127.0.0.1:43210".parse().unwrap();
+        Self::build(bound, HostPolicy::single(bound))
+    }
+
+    /// 通配夹具：只替换 Host 策略，不真正绑定 `0.0.0.0`。
+    ///
+    /// 自动测试若真的监听所有网卡，会短暂把临时共享暴露到局域网，并可能触发
+    /// 开发机防火墙提示；这里用同一套中间件与夹具验证白名单语义，真实内核
+    /// HTTP 由使用回环监听器的用例单独覆盖。
+    fn wildcard() -> Self {
+        let bound: SocketAddr = "192.168.1.10:43210".parse().unwrap();
+        Self::wildcard_for(bound)
+    }
+
+    /// 通配策略夹具；`bound` 是请求使用的 Host 与状态展示地址，端口必须与
+    /// 白名单端口一致，才能复现真实启动时的精确端口校验。
+    fn wildcard_for(bound: SocketAddr) -> Self {
+        let allowed = vec![Ipv4Addr::LOCALHOST, Ipv4Addr::new(192, 168, 1, 10)];
+        Self::build(bound, HostPolicy::wildcard(bound.port(), allowed))
+    }
+
+    fn build(bound: SocketAddr, hosts: HostPolicy) -> Self {
         let root = TempDir::new().unwrap();
         // 共享根名字不能以点开头（隐藏目录按规则拒绝），因此使用临时目录下的显式子目录。
         let share = root.path().join("share");
         std::fs::create_dir(&share).unwrap();
-        let bound: SocketAddr = "127.0.0.1:43210".parse().unwrap();
         let state = State::new();
         let (sessions, secret) = Sessions::start(1).unwrap();
         // `mark_running` 只接受 `Starting` 来源，先走一次真实启动转换；
@@ -60,7 +85,7 @@ impl Fixture {
             sessions,
             tickets: Tickets::new(1),
             root: ShareRoot::open(&share).unwrap(),
-            bound,
+            hosts,
             // 单代次、未取消：夹具直接用同一份上下文驱动停止路径。
             run: RunHandle::new(1),
             stats,
@@ -175,6 +200,185 @@ async fn rejects_foreign_host() {
         .unwrap();
     let (status, _, _) = fixture.send(request).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// 通配监听只接受冻结的本机 IPv4 与实际端口；其他本机网段地址、通配地址、
+/// 主机名和错误端口都不能穿过第一道门禁。被拒绝的响应仍带安全头。
+#[tokio::test]
+async fn wildcard_host_accepts_only_frozen_local_ipv4_and_exact_port() {
+    let fixture = Fixture::wildcard();
+    for host in ["192.168.1.10:43210", "127.0.0.1:43210"] {
+        let request = Request::builder()
+            .uri("/")
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            fixture.send(request).await.0,
+            StatusCode::OK,
+            "Host {host} must be accepted"
+        );
+    }
+    for host in [
+        "192.168.1.10:43211",
+        "192.168.1.11:43210",
+        "0.0.0.0:43210",
+        "localhost:43210",
+        "attacker.example:43210",
+        "[::1]:43210",
+    ] {
+        let request = Request::builder()
+            .uri("/")
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, _) = fixture.send(request).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "Host {host} must be rejected"
+        );
+        assert_eq!(
+            headers
+                .get(header::X_FRAME_OPTIONS)
+                .and_then(|value| value.to_str().ok()),
+            Some("DENY"),
+            "rejected Host {host} must still carry security headers"
+        );
+    }
+    // 缺少 Host 没有可比对的 authority，必须失败关闭。
+    let request = Request::builder().uri("/").body(Body::empty()).unwrap();
+    assert_eq!(fixture.send(request).await.0, StatusCode::BAD_REQUEST);
+}
+
+/// 通配监听的 Origin 必须与本次请求已通过白名单的 Host 精确同源；
+/// 另一个本机 IPv4 也是不同源，不能用「都在本机」替代同源校验。
+#[tokio::test]
+async fn wildcard_origin_must_match_the_request_host() {
+    let fixture = Fixture::wildcard();
+    let body = format!("{{\"secret\":\"{}\"}}", fixture.secret);
+    let cases = [
+        (
+            "192.168.1.10:43210",
+            Some("http://192.168.1.10:43210"),
+            StatusCode::OK,
+        ),
+        (
+            "192.168.1.10:43210",
+            Some("http://127.0.0.1:43210"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "192.168.1.10:43210",
+            Some("http://attacker.example:43210"),
+            StatusCode::FORBIDDEN,
+        ),
+        ("192.168.1.10:43210", None, StatusCode::FORBIDDEN),
+        (
+            "127.0.0.1:43210",
+            Some("http://127.0.0.1:43210"),
+            StatusCode::OK,
+        ),
+    ];
+    for (host, origin, expected) in cases {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri("/api/pair")
+            .header(header::HOST, host)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(origin) = origin {
+            builder = builder.header(header::ORIGIN, origin);
+        }
+        let request = builder.body(Body::from(body.clone())).unwrap();
+        assert_eq!(
+            fixture.send(request).await.0,
+            expected,
+            "Host {host} Origin {origin:?}"
+        );
+    }
+}
+
+/// 通配策略在真实回环监听上仍按同一套中间件工作：具体本机 IPv4 Host 可以
+/// 打开页面与完成同源配对，任意 Host 返回 400，跨源写请求返回 403。
+///
+/// 监听器只绑定回环，避免自动测试把临时共享暴露到局域网；通配策略的 Host
+/// 白名单仍包含一个合成局域网地址，用于证明校验依据是 Host 而不是连接地址。
+#[tokio::test]
+async fn wildcard_policy_serves_real_http_only_for_local_host() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let bound: SocketAddr = format!("192.168.1.10:{port}").parse().unwrap();
+    let fixture = Fixture::wildcard_for(bound);
+    let app = fixture.app.clone();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let allowed = raw_http(
+        port,
+        &format!("GET / HTTP/1.1\r\nHost: 192.168.1.10:{port}\r\nConnection: close\r\n\r\n"),
+    )
+    .await;
+    assert!(
+        allowed.starts_with("HTTP/1.1 200 OK"),
+        "allowed Host must reach the page: {allowed}"
+    );
+    let loopback = raw_http(
+        port,
+        &format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    )
+    .await;
+    assert!(
+        loopback.starts_with("HTTP/1.1 200 OK"),
+        "loopback IPv4 must be accepted: {loopback}"
+    );
+    let rejected = raw_http(
+        port,
+        &format!("GET / HTTP/1.1\r\nHost: attacker.example:{port}\r\nConnection: close\r\n\r\n"),
+    )
+    .await;
+    assert!(
+        rejected.starts_with("HTTP/1.1 400 Bad Request"),
+        "foreign Host must be rejected: {rejected}"
+    );
+
+    let body = format!("{{\"secret\":\"{}\"}}", fixture.secret);
+    let cross = raw_http(
+        port,
+        &format!(
+            "POST /api/pair HTTP/1.1\r\nHost: 192.168.1.10:{port}\r\nOrigin: http://attacker.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await;
+    assert!(
+        cross.starts_with("HTTP/1.1 403 Forbidden"),
+        "cross-origin pairing must be rejected: {cross}"
+    );
+    let same = raw_http(
+        port,
+        &format!(
+            "POST /api/pair HTTP/1.1\r\nHost: 192.168.1.10:{port}\r\nOrigin: http://192.168.1.10:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await;
+    assert!(
+        same.starts_with("HTTP/1.1 200 OK"),
+        "same-origin pairing must succeed: {same}"
+    );
+
+    server.abort();
+}
+
+/// 发一条原始 HTTP/1.1 请求并读完响应；只用于回环真实监听用例，
+/// 不依赖任何浏览器或外部网络。
+async fn raw_http(port: u16, request: &str) -> String {
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    String::from_utf8_lossy(&response).into_owned()
 }
 
 /// 状态变更请求缺少或伪造 Origin 一律拒绝，避免跨站表单触发写操作。
@@ -562,7 +766,13 @@ async fn unusable_range_is_ignored_and_returns_full_body() {
         .upload_and_ticket(&token, "range-ignore.txt", payload)
         .await;
 
-    for value in ["items=0-1", "bytes=", "bytes=abc-def", "bytes=7-4", "bytes=0-1,4-5"] {
+    for value in [
+        "items=0-1",
+        "bytes=",
+        "bytes=abc-def",
+        "bytes=7-4",
+        "bytes=0-1,4-5",
+    ] {
         let request = Request::builder()
             .uri(&url)
             .header(header::HOST, fixture.bound.to_string())

@@ -7,7 +7,7 @@
 
 use kerminal_plugin_lan_transfer::{
     rpc::data,
-    state::{Phase, Snapshot},
+    state::{AddressOption, Phase, Snapshot},
 };
 
 /// 构造最小快照；只填与视图映射相关的字段，其余保持空值。
@@ -21,6 +21,7 @@ fn snapshot(phase: Phase, uploaded: u64, downloaded: u64) -> Snapshot {
         qr: None,
         selected_address: "192.168.1.10".into(),
         addresses: vec!["192.168.1.10".into()],
+        address_options: Vec::new(),
         status: String::new(),
         error: None,
         uploaded,
@@ -166,23 +167,90 @@ fn scope_follows_bound_address() {
     assert_eq!(data(&snapshot(Phase::Running, 0, 0), false)["scope"], "");
 }
 
-/// 地址提示把回环说明另起一行：地址列表与限制说明不能挤成带行首分号的
-/// 一整段，否则长列表换行后会出现悬空标点。
+/// 编辑区只保留一句短提示：新宿主用下拉列出地址，旧宿主忽略扩展后仍能
+/// 从提示得知可输入 `0.0.0.0`；不能再把地址拼成逗号列表与下拉重复。
 #[test]
-fn address_hint_puts_loopback_note_on_its_own_line() {
+fn address_hint_is_short_and_mentions_wildcard() {
     let mut snapshot = snapshot(Phase::Idle, 0, 0);
     snapshot.addresses = vec!["127.0.0.1".into(), "192.168.1.10".into()];
     let hint = data(&snapshot, false)["addresses_hint"]
         .as_str()
         .unwrap()
         .to_owned();
-    let note = hint
-        .split('\n')
-        .nth(1)
-        .expect("loopback note on a new line");
-    assert!(note.contains("127.0.0.1"), "{hint}");
-    assert!(!note.starts_with(';'), "{hint}");
-    assert!(!hint.contains("；"), "{hint}");
+    assert!(hint.contains("0.0.0.0"), "{hint}");
+    assert!(
+        !hint.contains(','),
+        "hint must not repeat an address list: {hint}"
+    );
+    assert!(
+        !hint.contains('\n'),
+        "hint must stay one short line: {hint}"
+    );
+}
+
+/// 下拉需要分别保留显示标签和地址值，确保界面足以区分每种范围且动作能提交实际地址。
+#[test]
+fn address_options_expose_loopback_and_wildcard() {
+    let mut snapshot = snapshot(Phase::Idle, 0, 0);
+    snapshot.address_options = vec![
+        AddressOption {
+            label: "192.168.1.10 · WLAN".into(),
+            value: "192.168.1.10".into(),
+        },
+        AddressOption {
+            label: "127.0.0.1 · This device only".into(),
+            value: "127.0.0.1".into(),
+        },
+        AddressOption {
+            label: "0.0.0.0 · All IPv4 adapters".into(),
+            value: "0.0.0.0".into(),
+        },
+    ];
+    let value = data(&snapshot, false);
+    let options = value["address_options"].as_array().unwrap();
+    assert_eq!(options.len(), 3);
+    for option in options {
+        assert!(!option["label"].as_str().unwrap().is_empty());
+        assert!(!option["value"].as_str().unwrap().is_empty());
+    }
+    assert!(
+        options.iter().any(|option| option["value"] == "0.0.0.0"
+            && option["label"].as_str().unwrap().contains("IPv4")),
+        "{options:?}"
+    );
+    assert!(
+        options.iter().any(|option| option["value"] == "127.0.0.1"
+            && option["label"].as_str().unwrap().contains("127.0.0.1")),
+        "{options:?}"
+    );
+}
+
+/// 通配监听运行时范围必须写成「所有网络接口」，并说明链接实际使用的具体
+/// IPv4 与 VPN/虚拟网卡、防火墙边界；具体地址模式不显示这条说明，避免占位。
+#[test]
+fn wildcard_running_discloses_scope_and_concrete_link_address() {
+    use kerminal_plugin_lan_transfer::l10n::{Key, Locale};
+
+    let mut wildcard = snapshot(Phase::Running, 0, 0);
+    wildcard.selected_address = "0.0.0.0".into();
+    wildcard.address = Some("192.168.1.10:43210".into());
+    wildcard.link = Some("http://192.168.1.10:43210/#secret".into());
+    let value = data(&wildcard, true);
+    assert_eq!(value["wildcard"], true);
+    assert_eq!(
+        value["scope"],
+        Locale::detect().text(Key::ScopeAllInterfaces)
+    );
+    let note = value["address_note"].as_str().unwrap();
+    assert!(note.contains("192.168.1.10:43210"), "{note}");
+    assert!(!note.contains("0.0.0.0:43210"), "{note}");
+
+    let mut single = snapshot(Phase::Running, 0, 0);
+    single.address = Some("192.168.1.10:43210".into());
+    let value = data(&single, false);
+    assert_eq!(value["wildcard"], false);
+    assert_eq!(value["address_note"], "");
+    assert_eq!(value["scope"], Locale::detect().text(Key::ScopeLan));
 }
 
 /// 面板外观契约：根滚动声明 inset，标题/操作行声明 header，分组区声明 grouped。
@@ -269,6 +337,13 @@ fn panel_declares_opt_in_appearance() {
     // 一次性配对密钥不能作为普通文本出现；复制必须走按钮动作。
     assert!(!text.contains("\"$link\""));
     assert!(text.contains("\"action\": \"copy-link\""));
+    // 地址输入保持原绑定与 Enter 提交，同时用扩展声明下拉选项；旧宿主忽略扩展。
+    assert!(text.contains("\"bind\": \"selected_address\""));
+    assert!(text.contains("\"on_submit\": \"set-address\""));
+    assert!(text.contains("\"x-kerminal-select-options\": \"$address_options\""));
+    // 通配运行的额外说明由数据里的 wildcard/address_note 控制，不能改成固定文案。
+    assert!(text.contains("\"text\": \"$address_note\""));
+    assert!(text.contains("\"visible\": \"$wildcard\""));
     // 复制结果只改按钮文案，不能再插入一条会推动二维码的独立提示行。
     assert!(text.contains("\"label\": \"$copy_label\""));
     assert!(!text.contains("\"$copy_status\""));

@@ -115,10 +115,11 @@ impl ViewRegistry {
             }
         }
         // 恢复地址选择：只接受当前仍存在的本机地址，旧状态里的其他字段一律忽略，
-        // 避免把上一次运行的链接或令牌带回新会话。
+        // 避免把上一次运行的链接或令牌带回新会话。通配地址额外受运行期约束：
+        // 宿主保存的旧草稿不能在未重新选择时把新进程自动切到全接口。
         if let Some(state) = params.get("state") {
             if let Some(address) = state.get("selected_address").and_then(Value::as_str) {
-                let _ = self.controller.state.select_address(address);
+                let _ = self.controller.state.restore_address(address);
             }
             // 目录路径只是本地输入草稿，回填失败不影响打开视图；真正校验发生在启动时。
             // 必须走带运行态门禁的入口：运行中重开一个携带旧目录的视图时，无条件
@@ -544,20 +545,37 @@ pub fn data(snapshot: &Snapshot, retains_running_resources: bool) -> Value {
         snapshot.phase,
         crate::state::Phase::Idle | crate::state::Phase::Failed
     ) && retains_running_resources);
+    // 通配监听的实际暴露范围比单个具体地址更广：它接受所有本机 IPv4 网卡，
+    // 包括 VPN 与虚拟网卡；链接仍必须使用一个具体地址，否则浏览器无法打开。
+    let locale = crate::l10n::Locale::detect();
+    let wildcard = snapshot.selected_address == crate::config::WILDCARD_ADDRESS;
     // 运行中的范围提示只描述实际可访问范围，不用「扫码」暗示手机一定能打开回环。
-    let scope = snapshot
-        .address
-        .as_deref()
-        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
-        .map(|address| {
-            if address.ip().is_loopback() {
-                crate::l10n::Key::ScopeLocalOnly
-            } else {
-                crate::l10n::Key::ScopeLan
-            }
-        })
-        .map(|key| crate::l10n::Locale::detect().text(key).to_owned())
-        .unwrap_or_default();
+    let scope = if wildcard {
+        locale.text(crate::l10n::Key::ScopeAllInterfaces)
+    } else {
+        snapshot
+            .address
+            .as_deref()
+            .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+            .map(|address| {
+                if address.ip().is_loopback() {
+                    crate::l10n::Key::ScopeLocalOnly
+                } else {
+                    crate::l10n::Key::ScopeLan
+                }
+            })
+            .map(|key| locale.text(key))
+            .unwrap_or_default()
+    };
+    // 只有通配监听才需要额外的链接说明；具体地址的范围已由 `scope` 表达。
+    // 文案带 `{address}` 占位，避免界面把 0.0.0.0 误当成可打开的主机。
+    let address_note = if wildcard {
+        locale
+            .text(crate::l10n::Key::AddressNoteWildcard)
+            .replace("{address}", snapshot.address.as_deref().unwrap_or(""))
+    } else {
+        String::new()
+    };
     json!({
         "root_path": snapshot.root_path,
         // `root_path` 是宿主可编辑的双向绑定，宿主会保护未提交草稿；运行中的
@@ -575,15 +593,21 @@ pub fn data(snapshot: &Snapshot, retains_running_resources: bool) -> Value {
         "can_start": can_start,
         "can_stop": can_stop,
         "address": snapshot.address,
-        // 绑定回环时只说明「仅本机」，不暗示其他设备可以打开。
+        // 绑定回环时只说明「仅本机」，不暗示其他设备可以打开；通配监听则说明
+        // 接受所有网络接口，避免用户把「同一局域网」当成完整范围。
         "scope": scope,
+        // 通配监听专用说明；具体地址模式下保持空串并由视图隐藏，不占布局。
+        "wildcard": wildcard,
+        "address_note": address_note,
         // `link` 含一次性配对密钥，仅供剪贴板动作和集成测试读取；面板不把它
         // 当作普通文本展示，避免密钥被截图或旁人看到。
         "link": snapshot.link,
         "root_name": snapshot.root_name,
         "qr": snapshot.qr,
         "selected_address": snapshot.selected_address,
-        "addresses_hint": addresses_text(&snapshot.addresses),
+        // 新宿主用下拉渲染这些选项；旧宿主忽略扩展，仍把同一字段当普通输入。
+        "address_options": snapshot.address_options,
+        "addresses_hint": address_hint(),
         "status": snapshot.status,
         "error": snapshot.error,
         // 错误行默认只在失败态出现；动作校验失败不会改变阶段，但会把
@@ -594,7 +618,7 @@ pub fn data(snapshot: &Snapshot, retains_running_resources: bool) -> Value {
         "expires_at": snapshot.expires_at,
         // 复制按钮文案是每个窗口自己的视图状态：复制成功后才切换成「已复制」，
         // 不使用额外提示行，也不会把二维码向下挤动。
-        "copy_label": crate::l10n::Locale::detect()
+        "copy_label": locale
             .text(crate::l10n::Key::CopyAction)
             .to_owned(),
     })
@@ -626,34 +650,15 @@ fn display_shared_path(path: &str) -> String {
     path.to_owned()
 }
 
-/// 可用地址提示：视图没有列表插值能力，只能显示 Sidecar 拼好的整句，
-/// 否则用户得靠猜才能填对监听地址。
+/// 编辑区只给一句短提示，不再枚举地址列表。
 ///
-/// 即使已经列出局域网地址也保留回环限制：回环仍是可选监听地址，用户可能主动
-/// 填入并误以为其他设备能打开。回环说明另起一行，避免和地址列表挤成带分号的
-/// 一整段，长列表换行时也不会出现行首标点。
-fn addresses_text(addresses: &[String]) -> String {
-    let locale = crate::l10n::Locale::detect();
-    let lan = addresses
-        .iter()
-        .filter(|address| {
-            address
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| !ip.is_loopback())
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if lan.is_empty() {
-        return locale
-            .text(crate::l10n::Key::AddressHintLoopback)
-            .to_owned();
-    }
-    format!(
-        "{}{}\n{}",
-        locale.text(crate::l10n::Key::AddressHint),
-        lan.join(", "),
-        locale.text(crate::l10n::Key::AddressHintLocalOnly)
-    )
+/// 新宿主用 `x-kerminal-select-options` 渲染下拉，枚举地址会与下拉重复；旧宿主
+/// 忽略扩展，但仍显示输入框与这句提示，因此提示必须同时告诉旧宿主可以输入
+/// `0.0.0.0`。两种宿主共用同一句文案，不需要再增加一个仅新宿主理解的扩展。
+fn address_hint() -> String {
+    crate::l10n::Locale::detect()
+        .text(crate::l10n::Key::AddressHint)
+        .to_owned()
 }
 
 /// 传输计数文案：视图只能绑定字符串，因此由 Sidecar 计算好整句，避免界面自己拼语言。
@@ -731,6 +736,7 @@ mod tests {
             qr: None,
             selected_address: String::new(),
             addresses: Vec::new(),
+            address_options: Vec::new(),
             status: String::new(),
             error: None,
             uploaded: 0,
