@@ -318,7 +318,7 @@ fn panel_declares_opt_in_appearance() {
         .expect("folder block");
     assert_eq!(
         folder_block["children"][0]["x-kerminal-appearance"],
-        "caption"
+        "label"
     );
     assert_eq!(folder_block["children"][1]["text"], "$shared_path");
     assert_eq!(
@@ -329,6 +329,10 @@ fn panel_declares_opt_in_appearance() {
         .iter()
         .find(|node| node["type"] == "stack" && node["children"][0]["text"] == "%field.address%")
         .expect("address block");
+    assert_eq!(
+        address_block["children"][0]["x-kerminal-appearance"],
+        "label"
+    );
     let address_list = &address_block["children"][1];
     assert_eq!(address_list["type"], "list");
     assert_eq!(address_list["items"], "$address_items");

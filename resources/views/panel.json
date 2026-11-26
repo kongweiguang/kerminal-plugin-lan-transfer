@@ -103,9 +103,8 @@
               "children": [
                 {
                   "type": "text",
-                  "x-kerminal-appearance": "caption",
-                  "text": "%field.folder%",
-                  "tone": "muted"
+                  "x-kerminal-appearance": "label",
+                  "text": "%field.folder%"
                 },
                 {
                   "type": "text",
@@ -120,9 +119,8 @@
               "children": [
                 {
                   "type": "text",
-                  "x-kerminal-appearance": "caption",
-                  "text": "%field.address%",
-                  "tone": "muted"
+                  "x-kerminal-appearance": "label",
+                  "text": "%field.address%"
                 },
                 {
                   "id": "running-addresses",
