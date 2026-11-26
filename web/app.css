@@ -202,38 +202,6 @@ button, input { font: inherit; color: inherit; }
 .chip.is-expiring .chip-dot { background: #d39a1f; }
 .chip.is-expired .chip-dot { background: var(--danger); }
 
-/* ---------- 提示条 ---------- */
-
-.notice {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 10px 14px;
-  margin-bottom: 16px;
-  border-radius: var(--radius-sm);
-  font-size: 13px;
-  line-height: 1.45;
-}
-
-.notice-warn { background: var(--warn-bg); border: 1px solid var(--warn-border); color: var(--warn-text); }
-
-/* 中文长句和粘贴进来的长路径都必须能在窄屏换行，否则会把整个文档撑出横向滚动。 */
-.notice > span:last-child { min-width: 0; overflow-wrap: anywhere; }
-
-.notice-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  border: 1.5px solid currentColor;
-  font-size: 11px;
-  font-weight: 700;
-  flex: none;
-  margin-top: 1px;
-}
-
 /* ---------- 主区 ---------- */
 
 .main { flex: 1 1 auto; padding-bottom: 28px; }
@@ -300,10 +268,6 @@ button, input { font: inherit; color: inherit; }
 .banner-error { background: var(--danger-soft); border: 1px solid var(--danger); color: var(--danger); }
 .banner-text { min-width: 0; overflow-wrap: anywhere; }
 
-.share-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 6px; }
-
-.share-head-main { min-width: 0; }
-
 .share-title {
   margin: 0;
   font-size: 21px;
@@ -311,8 +275,6 @@ button, input { font: inherit; color: inherit; }
   letter-spacing: -0.01em;
   overflow-wrap: anywhere;
 }
-
-.share-sub { margin: 4px 0 0; color: var(--text-muted); font-size: 13px; line-height: 1.5; }
 
 /* ---------- 面包屑 ---------- */
 
@@ -667,16 +629,6 @@ button, input { font: inherit; color: inherit; }
   font-size: 15px;
   font-weight: 600;
   box-shadow: var(--shadow);
-}
-
-/* ---------- 页脚 ---------- */
-
-.foot {
-  padding: 16px 2px 22px;
-  border-top: 1px solid var(--border);
-  color: var(--text-faint);
-  font-size: 12px;
-  text-align: center;
 }
 
 .noscript {

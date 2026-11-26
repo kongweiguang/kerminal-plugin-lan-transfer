@@ -40,11 +40,6 @@
       </div>
     </header>
 
-    <div class="notice notice-warn" id="plaintext-notice" role="note">
-      <span class="notice-icon" aria-hidden="true">!</span>
-      <span id="plaintext-text">HTTP 明文传输：同一网络中的人可能看到文件内容与会话信息，请只在可信网络使用。</span>
-    </div>
-
     <main class="main">
       <!-- 同页换 fragment 不会重载页面；新链接被保留还是忽略都用这条提示说明，
            放在两个视图之外，保证连接页与浏览页都能看到。 -->
@@ -70,12 +65,7 @@
           <button class="btn btn-ghost btn-small" id="browse-banner-action" type="button" hidden>重试连接</button>
         </div>
 
-        <div class="share-head">
-          <div class="share-head-main">
-            <h1 class="share-title" id="share-title">共享目录</h1>
-            <p class="share-sub" id="share-sub">持有链接者可浏览并上传到此目录；链接视同密码，请勿转发给不可信的人。</p>
-          </div>
-        </div>
+        <h1 class="share-title" id="share-title">共享目录</h1>
 
         <nav class="crumbs" id="breadcrumbs" aria-label="路径"></nav>
 
@@ -123,9 +113,6 @@
       </section>
     </main>
 
-    <footer class="foot">
-      <span data-i18n="footNote">HTTP 明文传输，不提供加密；下载是否完成由浏览器决定。</span>
-    </footer>
   </div>
 
   <div class="drop-overlay" id="drop-overlay" hidden>

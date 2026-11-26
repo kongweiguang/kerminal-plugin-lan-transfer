@@ -249,7 +249,7 @@ fn parse_batch(
     entries: &mut Vec<DirEntryInfo>,
 ) -> io::Result<()> {
     // 任何调用方给出的窗口都不能超过真实分配，否则下面的边界检查本身就会越界。
-    let buffer_bytes = buffer_bytes.min(buffer.len() * std::mem::size_of::<u64>());
+    let buffer_bytes = buffer_bytes.min(std::mem::size_of_val(buffer));
     let base = buffer.as_ptr() as *const u8;
     let header = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
     let mut offset = 0usize;
@@ -272,7 +272,7 @@ fn parse_batch(
             );
         }
         let name_bytes = info.FileNameLength as usize;
-        if name_bytes % 2 != 0 {
+        if !name_bytes.is_multiple_of(2) {
             return Err(corrupt("directory entry name length is odd"));
         }
         let name_end = offset + header + name_bytes;
@@ -283,20 +283,17 @@ fn parse_batch(
         name.extend((0..name_bytes / 2).map(|index| unsafe {
             std::ptr::read_unaligned(base.add(offset + header + index * 2) as *const u16)
         }));
-        match String::from_utf16(&name) {
-            Ok(name) => {
-                if let Some(entry) = classify(
-                    &name,
-                    info.FileAttributes,
-                    info.EndOfFile,
-                    info.LastWriteTime,
-                ) {
-                    entries.push(entry);
-                }
-            }
-            // 非法 UTF-16 无法无损传给浏览器，按不可见处理；这不是记录损坏，
-            // 与越界偏移区分开，避免把个别怪名字升级成整份列表失败。
-            Err(_) => {}
+        // 非法 UTF-16 无法无损传给浏览器，按不可见处理；这不是记录损坏，
+        // 与越界偏移区分开，避免把个别怪名字升级成整份列表失败。
+        if let Ok(name) = String::from_utf16(&name)
+            && let Some(entry) = classify(
+                &name,
+                info.FileAttributes,
+                info.EndOfFile,
+                info.LastWriteTime,
+            )
+        {
+            entries.push(entry);
         }
         if info.NextEntryOffset == 0 {
             return Ok(());

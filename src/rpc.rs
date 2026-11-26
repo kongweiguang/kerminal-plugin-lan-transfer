@@ -171,7 +171,9 @@ impl ViewRegistry {
         // 复制等待宿主确认时可能遇到另一个窗口停止或重启共享。独立分派可以
         // 避免迟到的全量回执覆盖其他窗口已经提交的生命周期状态。
         if action == "copy-link" {
-            return self.copy_link(context, caller.as_deref(), cancel).await;
+            return self
+                .copy_link(context, caller.as_deref(), &payload, cancel)
+                .await;
         }
         // 动作前的投影用于判断失败是否真的改变了可见状态；只有变化时才推送给
         // 调用方，避免把「参数无效」这类没有状态变化的结果写成一次假更新。
@@ -189,7 +191,9 @@ impl ViewRegistry {
         // 启动/停止会更换或撤销链接，必须让所有窗口重置复制按钮；其他成功动作
         // （例如只改地址或复制本身）不应重置其他窗口的确认，因此广播前去掉
         // 这个只属于单个实例的字段。
-        let lifecycle = matches!(action, "start" | "stop");
+        // 切换展示 IP 会改变链接与二维码，其他窗口的「已复制」确认同样失效，
+        // 因此与启动/停止一样广播重置后的按钮文案。
+        let lifecycle = matches!(action, "start" | "stop" | "select-active-ip");
         let mut broadcast_patch = patch.clone();
         if outcome.is_ok() && !lifecycle {
             omit_copy_label(&mut broadcast_patch);
@@ -234,47 +238,126 @@ impl ViewRegistry {
     /// 停止或重启服务，所以必须在 ACK 后重新取快照，并同时比较链接与代次标识，
     /// 才能确认剪贴板里仍是当前链接。业务失败只在调用窗口写局部错误；宿主错误
     /// 保持协议码与原文，既不伪装成业务错误，也不写进插件的内联错误行。
+    ///
+    /// 通配运行态额外承担旧宿主的兜底：旧宿主不认识
+    /// `x-kerminal-on-change`，用户切换下拉后只会把新值留在动作数据里。这里
+    /// 在看到不同的白名单 IP 时先切换再复制，保证剪贴板内容与界面选择一致；
+    /// 单地址模式的既有语义不变。
     async fn copy_link(
         &self,
         context: &Context,
         caller: Option<&str>,
+        payload: &Value,
         cancel: CancellationToken,
     ) -> Result<Value> {
         let before = self.snapshot()?;
-        let failure_key = if let Ok(link) = copyable_link(&before) {
-            context
-                .request("clipboard.write", json!({ "text": link }), cancel.clone())
-                .await?;
-            if cancel.is_cancelled() {
-                return Err(Error::new(-32002, "cancelled"));
-            }
-            let after = self.snapshot()?;
-            if copyable_link(&after).is_ok_and(|current| current == link)
-                && before.started_at == after.started_at
-                && before.expires_at == after.expires_at
-            {
-                return Ok(
-                    json!({ "patch": { "copy_label": Locale::detect().text(Key::CopyDone) } }),
-                );
-            }
-            Key::ErrorCopyLinkChanged
-        } else {
-            Key::ErrorNotRunning
-        };
-
-        let failure = ActionFailure::business(ERROR_NOT_RUNNING, failure_key);
-        // 与协议错误使用同一文案，让支持内联错误的宿主抑制重复提示。
-        if let Some(caller) = caller {
-            let patch = json!({
-                "error": failure.error.message,
-                "show_error": true,
-                "copy_label": Locale::detect().text(Key::CopyAction),
-            });
-            let _ = context
-                .notify("view.update", json!({ "instance": caller, "patch": patch }))
+        if before.phase != crate::state::Phase::Running {
+            return self
+                .copy_failure(
+                    context,
+                    caller,
+                    ActionFailure::business(ERROR_NOT_RUNNING, Key::ErrorNotRunning),
+                )
                 .await;
         }
+
+        // 旧宿主兜底：动作数据里带了不同的白名单 IP 就先切换。切换失败说明
+        // 选项已过期或不在本次冻结白名单内，不能继续复制一个界面正在显示的
+        // 未生效地址。
+        let switched = if before.wildcard {
+            match requested_active_ip(payload) {
+                Some(requested) if requested != before.active_ip => {
+                    if let Err(error) = self.controller.state.select_active_ip(requested) {
+                        let failure = select_ip_failure(&error);
+                        self.notify_caller(context, caller, failure_patch(&failure))
+                            .await;
+                        return Err(failure.error);
+                    }
+                    Some(self.snapshot()?)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // 切换已经真实发生，必须让其他窗口同步新链接与二维码；复制确认本身
+        // 仍只属于调用窗口，因此广播补丁里不含 `copy_label`。
+        if let Some(snapshot) = &switched {
+            self.broadcast(context, caller, share_patch(snapshot)).await;
+        }
+
+        let current = switched.as_ref().unwrap_or(&before);
+        let Ok(link) = copyable_link(current) else {
+            return self
+                .copy_failure(
+                    context,
+                    caller,
+                    ActionFailure::business(ERROR_NOT_RUNNING, Key::ErrorNotRunning),
+                )
+                .await;
+        };
+        if let Err(error) = context
+            .request("clipboard.write", json!({ "text": link }), cancel.clone())
+            .await
+        {
+            // 宿主拒绝/超时时，若已切换地址，调用窗口仍需要看到新的链接状态，
+            // 否则输入框会停在旧值而服务端已经切换。
+            if let Some(snapshot) = &switched {
+                self.notify_caller(context, caller, share_patch(snapshot))
+                    .await;
+            }
+            return Err(error);
+        }
+        if cancel.is_cancelled() {
+            return Err(Error::new(-32002, "cancelled"));
+        }
+        let after = self.snapshot()?;
+        if after.link.as_deref() == Some(link.as_str())
+            && before.started_at == after.started_at
+            && before.expires_at == after.expires_at
+        {
+            let mut patch = switched
+                .as_ref()
+                .map(share_patch)
+                .unwrap_or_else(|| json!({}));
+            if let Some(object) = patch.as_object_mut() {
+                object.insert(
+                    "copy_label".into(),
+                    Value::String(Locale::detect().text(Key::CopyDone).to_owned()),
+                );
+            }
+            return Ok(json!({ "patch": patch }));
+        }
+
+        let failure = ActionFailure::business(ERROR_NOT_RUNNING, Key::ErrorCopyLinkChanged);
+        self.notify_caller(context, caller, failure_patch(&failure))
+            .await;
         Err(failure.error)
+    }
+
+    /// 复制路径的失败回执：只在调用窗口写内联错误并把复制按钮恢复默认文案。
+    ///
+    /// 不能广播：失败没有改变共享状态，其他窗口的「已复制」确认不应被清掉。
+    async fn copy_failure(
+        &self,
+        context: &Context,
+        caller: Option<&str>,
+        failure: ActionFailure,
+    ) -> Result<Value> {
+        self.notify_caller(context, caller, failure_patch(&failure))
+            .await;
+        Err(failure.error)
+    }
+
+    /// 向单个调用窗口推送补丁；实例缺失或推送失败都不改变动作结果。
+    async fn notify_caller(&self, context: &Context, caller: Option<&str>, patch: Value) {
+        let Some(caller) = caller else {
+            return;
+        };
+        let _ = context
+            .notify("view.update", json!({ "instance": caller, "patch": patch }))
+            .await;
     }
 
     /// 执行单个动作；失败时同时保留协议错误与可选的面板内联文案。
@@ -356,6 +439,30 @@ impl ViewRegistry {
                     .state
                     .select_address(value)
                     .map_err(ActionFailure::app)?;
+            }
+            // 通配运行期切换展示 IP：只改链接/二维码与选中值，绝不重启监听。
+            // 未运行与单地址模式都拒绝，避免界面出现一个无法解释的“切换成功”。
+            "select-active-ip" => {
+                let Some(value) = payload.get("active_ip").and_then(Value::as_str) else {
+                    return Err(ActionFailure::protocol(Error::new(
+                        -32602,
+                        "missing active_ip",
+                    )));
+                };
+                let snapshot = self.snapshot().map_err(ActionFailure::protocol)?;
+                if snapshot.phase != crate::state::Phase::Running {
+                    return Err(ActionFailure::business(
+                        ERROR_NOT_RUNNING,
+                        Key::ErrorNotRunning,
+                    ));
+                }
+                if !snapshot.wildcard {
+                    return Err(ActionFailure::validation(Key::ErrorAddressInvalid));
+                }
+                self.controller
+                    .state
+                    .select_active_ip(value)
+                    .map_err(|error| select_ip_failure(&error))?;
             }
             // `copy-link` 由 `action` 在广播/快照流程之前单独分派，不能在这里补回
             // 通用分派分支：否则会让宿主剪贴板请求重新进入全量快照路径。
@@ -501,6 +608,58 @@ fn copyable_link(snapshot: &Snapshot) -> Result<String> {
         .ok_or_else(|| Error::new(ERROR_NOT_RUNNING, "not running"))
 }
 
+/// 从动作数据里取用户当前选择的展示 IP；空串等同未提供。
+///
+/// 旧宿主的输入框失焦不会触发动作，值只会在后续动作数据里出现；去掉首尾空白
+/// 是这里唯一能做的规范化，避免把空白当成一个不同的地址。
+fn requested_active_ip(payload: &Value) -> Option<&str> {
+    payload
+        .get("active_ip")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// 切换展示 IP 失败到动作失败的映射。
+///
+/// 状态已变化（例如服务刚被另一窗口停止）必须继续报「未运行」；其余情况都是
+/// 用户选了一个过期/不在白名单的地址，归入输入错误，面板才能显示可修正原因。
+fn select_ip_failure(error: &crate::error::AppError) -> ActionFailure {
+    if error.code == crate::error::ErrorCode::Unavailable {
+        ActionFailure::business(ERROR_NOT_RUNNING, Key::ErrorNotRunning)
+    } else {
+        ActionFailure::validation(Key::ErrorAddressInvalid)
+    }
+}
+
+/// 复制失败的最小补丁：内联原因 + 恢复按钮文案，不带任何共享状态。
+///
+/// 失败没有改变服务端事实，若顺带写回 `link`/`qr`，迟到的补丁会覆盖另一窗口
+/// 刚提交的生命周期结果；这正是复制路径最初独立于全量快照的原因。
+fn failure_patch(failure: &ActionFailure) -> Value {
+    json!({
+        "error": failure.error.message,
+        "show_error": true,
+        "copy_label": Locale::detect().text(Key::CopyAction),
+    })
+}
+
+/// 切换展示 IP 后需要同步给视图的最小字段集。
+///
+/// 只包含网络展示相关字段，不重放 `root_path` 等可编辑草稿：另一个窗口里
+/// 未提交的目录输入不能被一次 IP 切换覆盖。
+fn share_patch(snapshot: &Snapshot) -> Value {
+    json!({
+        "wildcard": snapshot.wildcard,
+        "single_address": snapshot.single_address,
+        "active_ip": snapshot.active_ip,
+        "active_ip_options": snapshot.active_ip_options,
+        "address": snapshot.address,
+        "link": snapshot.link,
+        "qr": snapshot.qr,
+    })
+}
+
 /// 去掉只属于单个实例的复制按钮文案。
 ///
 /// 非生命周期的跨窗口广播不能重置各窗口自己的「已复制」；统计推送更是只发
@@ -545,37 +704,7 @@ pub fn data(snapshot: &Snapshot, retains_running_resources: bool) -> Value {
         snapshot.phase,
         crate::state::Phase::Idle | crate::state::Phase::Failed
     ) && retains_running_resources);
-    // 通配监听的实际暴露范围比单个具体地址更广：它接受所有本机 IPv4 网卡，
-    // 包括 VPN 与虚拟网卡；链接仍必须使用一个具体地址，否则浏览器无法打开。
     let locale = crate::l10n::Locale::detect();
-    let wildcard = snapshot.selected_address == crate::config::WILDCARD_ADDRESS;
-    // 运行中的范围提示只描述实际可访问范围，不用「扫码」暗示手机一定能打开回环。
-    let scope = if wildcard {
-        locale.text(crate::l10n::Key::ScopeAllInterfaces)
-    } else {
-        snapshot
-            .address
-            .as_deref()
-            .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
-            .map(|address| {
-                if address.ip().is_loopback() {
-                    crate::l10n::Key::ScopeLocalOnly
-                } else {
-                    crate::l10n::Key::ScopeLan
-                }
-            })
-            .map(|key| locale.text(key))
-            .unwrap_or_default()
-    };
-    // 只有通配监听才需要额外的链接说明；具体地址的范围已由 `scope` 表达。
-    // 文案带 `{address}` 占位，避免界面把 0.0.0.0 误当成可打开的主机。
-    let address_note = if wildcard {
-        locale
-            .text(crate::l10n::Key::AddressNoteWildcard)
-            .replace("{address}", snapshot.address.as_deref().unwrap_or(""))
-    } else {
-        String::new()
-    };
     json!({
         "root_path": snapshot.root_path,
         // `root_path` 是宿主可编辑的双向绑定，宿主会保护未提交草稿；运行中的
@@ -593,12 +722,12 @@ pub fn data(snapshot: &Snapshot, retains_running_resources: bool) -> Value {
         "can_start": can_start,
         "can_stop": can_stop,
         "address": snapshot.address,
-        // 绑定回环时只说明「仅本机」，不暗示其他设备可以打开；通配监听则说明
-        // 接受所有网络接口，避免用户把「同一局域网」当成完整范围。
-        "scope": scope,
-        // 通配监听专用说明；具体地址模式下保持空串并由视图隐藏，不占布局。
-        "wildcard": wildcard,
-        "address_note": address_note,
+        // 通配运行期的网络信息只在 `Running` 时由快照给出；视图据此在
+        // 「可切换 IP」与「固定单地址」两种展示之间切换，非运行态不泄露端口/密钥。
+        "wildcard": snapshot.wildcard,
+        "single_address": snapshot.single_address,
+        "active_ip": snapshot.active_ip,
+        "active_ip_options": snapshot.active_ip_options,
         // `link` 含一次性配对密钥，仅供剪贴板动作和集成测试读取；面板不把它
         // 当作普通文本展示，避免密钥被截图或旁人看到。
         "link": snapshot.link,
@@ -607,7 +736,6 @@ pub fn data(snapshot: &Snapshot, retains_running_resources: bool) -> Value {
         "selected_address": snapshot.selected_address,
         // 新宿主用下拉渲染这些选项；旧宿主忽略扩展，仍把同一字段当普通输入。
         "address_options": snapshot.address_options,
-        "addresses_hint": address_hint(),
         "status": snapshot.status,
         "error": snapshot.error,
         // 错误行默认只在失败态出现；动作校验失败不会改变阶段，但会把
@@ -648,17 +776,6 @@ fn display_shared_path(path: &str) -> String {
         }
     }
     path.to_owned()
-}
-
-/// 编辑区只给一句短提示，不再枚举地址列表。
-///
-/// 新宿主用 `x-kerminal-select-options` 渲染下拉，枚举地址会与下拉重复；旧宿主
-/// 忽略扩展，但仍显示输入框与这句提示，因此提示必须同时告诉旧宿主可以输入
-/// `0.0.0.0`。两种宿主共用同一句文案，不需要再增加一个仅新宿主理解的扩展。
-fn address_hint() -> String {
-    crate::l10n::Locale::detect()
-        .text(crate::l10n::Key::AddressHint)
-        .to_owned()
 }
 
 /// 传输计数文案：视图只能绑定字符串，因此由 Sidecar 计算好整句，避免界面自己拼语言。
@@ -739,6 +856,10 @@ mod tests {
             address_options: Vec::new(),
             status: String::new(),
             error: None,
+            wildcard: false,
+            single_address: true,
+            active_ip: String::new(),
+            active_ip_options: Vec::new(),
             uploaded: 0,
             downloaded: 0,
             started_at: None,

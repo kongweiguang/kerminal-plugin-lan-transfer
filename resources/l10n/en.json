@@ -1,10 +1,8 @@
 {
   "tool.title": "LAN File Transfer",
-  "section.share": "Share",
   "field.folder": "Folder",
   "field.address": "Address",
   "placeholder.address": "Local IP address",
   "action.start": "Start",
-  "action.stop": "Stop",
-  "notice.plaintext": "Anyone with the link can read or upload files. Use unencrypted HTTP only on trusted networks."
+  "action.stop": "Stop"
 }

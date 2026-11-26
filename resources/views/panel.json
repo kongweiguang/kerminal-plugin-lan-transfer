@@ -5,7 +5,6 @@
     "shared_path": null,
     "selected_address": "",
     "address_options": [],
-    "addresses_hint": "0.0.0.0 includes VPN and virtual adapters.",
     "running": false,
     "starting": false,
     "stopping": false,
@@ -14,9 +13,10 @@
     "can_start": true,
     "can_stop": false,
     "address": null,
-    "scope": "",
     "wildcard": false,
-    "address_note": "",
+    "single_address": true,
+    "active_ip": "",
+    "active_ip_options": [],
     "link": null,
     "root_name": null,
     "qr": null,
@@ -40,21 +40,9 @@
           "gap": "sm",
           "children": [
             {
-              "type": "stack",
-              "gap": "sm",
-              "children": [
-                {
-                  "type": "text",
-                  "x-kerminal-appearance": "title",
-                  "text": "%tool.title%"
-                },
-                {
-                  "type": "badge",
-                  "x-kerminal-appearance": "caption",
-                  "text": "$status",
-                  "tone": "default"
-                }
-              ]
+              "type": "text",
+              "x-kerminal-appearance": "title",
+              "text": "%tool.title%"
             },
             {
               "type": "button",
@@ -79,9 +67,9 @@
         },
         {
           "type": "section",
-          "title": "%section.share%",
+          "title": "",
           "x-kerminal-appearance": "grouped",
-          "gap": "sm",
+          "gap": "md",
           "visible": "$editable",
           "children": [
             {
@@ -97,55 +85,86 @@
               "placeholder": "%placeholder.address%",
               "on_submit": "set-address",
               "x-kerminal-select-options": "$address_options"
-            },
-            {
-              "type": "text",
-              "x-kerminal-appearance": "caption",
-              "text": "$addresses_hint",
-              "tone": "muted"
             }
           ]
         },
         {
           "type": "section",
-          "title": "$root_name",
+          "title": "",
           "x-kerminal-appearance": "grouped",
-          "gap": "sm",
+          "gap": "md",
           "visible": "$running",
           "children": [
             {
-              "type": "text",
-              "text": "$shared_path"
+              "type": "stack",
+              "gap": "sm",
+              "children": [
+                {
+                  "type": "text",
+                  "x-kerminal-appearance": "caption",
+                  "text": "%field.folder%",
+                  "tone": "muted"
+                },
+                {
+                  "type": "text",
+                  "x-kerminal-appearance": "value",
+                  "text": "$shared_path"
+                }
+              ]
             },
             {
-              "type": "text",
-              "x-kerminal-appearance": "caption",
-              "text": "%field.address%",
-              "tone": "muted"
-            },
-            {
-              "type": "text",
-              "text": "$address"
-            },
-            {
-              "type": "text",
-              "x-kerminal-appearance": "caption",
-              "text": "$scope",
-              "tone": "muted"
-            },
-            {
-              "type": "text",
-              "x-kerminal-appearance": "caption",
-              "text": "$address_note",
-              "tone": "muted",
-              "visible": "$wildcard"
-            },
-            {
-              "type": "button",
-              "action": "copy-link",
-              "label": "$copy_label",
-              "icon": "copy",
-              "variant": "secondary"
+              "type": "stack",
+              "gap": "sm",
+              "children": [
+                {
+                  "type": "text",
+                  "x-kerminal-appearance": "caption",
+                  "text": "%field.address%",
+                  "tone": "muted"
+                },
+                {
+                  "type": "row",
+                  "x-kerminal-appearance": "stretch-first",
+                  "gap": "sm",
+                  "visible": "$wildcard",
+                  "children": [
+                    {
+                      "type": "input",
+                      "bind": "active_ip",
+                      "on_submit": "select-active-ip",
+                      "x-kerminal-select-options": "$active_ip_options",
+                      "x-kerminal-on-change": "select-active-ip"
+                    },
+                    {
+                      "type": "button",
+                      "action": "copy-link",
+                      "label": "$copy_label",
+                      "icon": "copy",
+                      "variant": "secondary"
+                    }
+                  ]
+                },
+                {
+                  "type": "row",
+                  "x-kerminal-appearance": "stretch-first",
+                  "gap": "sm",
+                  "visible": "$single_address",
+                  "children": [
+                    {
+                      "type": "text",
+                      "x-kerminal-appearance": "mono",
+                      "text": "$address"
+                    },
+                    {
+                      "type": "button",
+                      "action": "copy-link",
+                      "label": "$copy_label",
+                      "icon": "copy",
+                      "variant": "secondary"
+                    }
+                  ]
+                }
+              ]
             },
             {
               "type": "qrcode",
@@ -164,12 +183,6 @@
           "text": "$error",
           "tone": "danger",
           "visible": "$show_error"
-        },
-        {
-          "type": "notice",
-          "x-kerminal-appearance": "caption",
-          "text": "%notice.plaintext%",
-          "tone": "warning"
         }
       ]
     }

@@ -49,13 +49,9 @@ pub enum Key {
     StatusRunning,
     StatusStopping,
     StatusFailed,
-    AddressHint,
     AddressOptionLoopback,
     AddressOptionAllInterfaces,
-    AddressNoteWildcard,
-    ScopeLocalOnly,
-    ScopeLan,
-    ScopeAllInterfaces,
+    ActiveIpLoopback,
     ErrorRootMissing,
     ErrorRootNotDirectory,
     ErrorRootRejected,
@@ -84,26 +80,13 @@ impl Key {
             // Failed 也可能来自停止失败；状态徽标不能写成「启动失败」，否则用户
             // 会把停止回收故障误判成启动问题。具体原因由下方错误行给出。
             Self::StatusFailed => ("操作失败", "Failed"),
-            Self::AddressHint => (
-                "0.0.0.0 包含 VPN 和虚拟网卡。",
-                "0.0.0.0 includes VPN and virtual adapters.",
-            ),
             // 下拉选项明确写出地址和监听范围，便于分辨回环和通配。
             Self::AddressOptionLoopback => ("127.0.0.1 · 仅本机", "127.0.0.1 · This device only"),
             Self::AddressOptionAllInterfaces => {
                 ("0.0.0.0 · 所有 IPv4 网卡", "0.0.0.0 · All IPv4 adapters")
             }
-            // 通配监听的实际暴露范围比「同一局域网」更广：VPN、虚拟网卡与其他
-            // 可路由接口都会被监听，防火墙还会进一步限制可达性。链接必须点明
-            // 实际使用的具体 IPv4，避免用户误以为 0.0.0.0 本身能打开。
-            Self::AddressNoteWildcard => (
-                "链接使用 {address}；0.0.0.0 监听所有 IPv4 网卡（含 VPN/虚拟网卡），实际可访问范围还取决于防火墙",
-                "Link uses {address}; 0.0.0.0 listens on all IPv4 interfaces (VPN/virtual included); reachability also depends on the firewall",
-            ),
-            // 运行区只描述实际可访问范围：回环明确写「仅本机」，不暗示手机可扫码打开。
-            Self::ScopeLocalOnly => ("仅本机", "This device only"),
-            Self::ScopeLan => ("同一局域网", "Same network only"),
-            Self::ScopeAllInterfaces => ("所有 IPv4 网卡", "All IPv4 adapters"),
+            // 通配运行期的回环选项：明确「仅本机」，避免用户把二维码发给外部设备。
+            Self::ActiveIpLoopback => ("仅本机", "This device only"),
             Self::ErrorRootMissing => ("请选择共享目录", "Choose a shared folder"),
             Self::ErrorRootNotDirectory => ("所选路径不是目录", "Selected path is not a folder"),
             Self::ErrorRootRejected => (
@@ -153,13 +136,9 @@ mod tests {
             Key::StatusRunning,
             Key::StatusStopping,
             Key::StatusFailed,
-            Key::AddressHint,
             Key::AddressOptionLoopback,
             Key::AddressOptionAllInterfaces,
-            Key::AddressNoteWildcard,
-            Key::ScopeLocalOnly,
-            Key::ScopeLan,
-            Key::ScopeAllInterfaces,
+            Key::ActiveIpLoopback,
             Key::ErrorRootMissing,
             Key::ErrorRootNotDirectory,
             Key::ErrorRootRejected,
@@ -193,18 +172,8 @@ mod tests {
         }
     }
 
-    /// 通配说明必须保留 `{address}` 占位：替换成固定文本会让用户无法知道
-    /// 链接实际使用哪一个具体 IPv4。
-    #[test]
-    fn wildcard_note_keeps_address_placeholder() {
-        let (zh, en) = Key::AddressNoteWildcard.pair();
-        for text in [zh, en] {
-            assert!(text.contains("{address}"), "{text}");
-        }
-    }
-
     /// 静态文案的键与视图文件里的 `%key%` 必须一一对应，中英两份都不能漏；
-    /// 漏键会让面板直接显示 `%section.share%` 这样的原始文本。
+    /// 漏键会让面板直接显示 `%field.folder%` 这样的原始文本。
     #[test]
     fn static_keys_match_view_and_both_locales() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

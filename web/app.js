@@ -378,7 +378,6 @@
   var ZH = {
     sessionRemaining: '会话剩余 {time}',
     sessionChecking: '正在确认会话…',
-    plaintext: 'HTTP 明文传输：同一网络中的人可能看到文件内容与会话信息，请只在可信网络使用。',
     connectTitle: '连接共享目录',
     connectBodyPairing: '正在与 Kerminal 建立会话…',
     connectBodyMissing: '请回到 Kerminal 的「局域网文件传输」面板，复制分享链接后重新打开。',
@@ -408,7 +407,6 @@
     // 面包屑栏标题，让只有文件夹名的一行明确表达“当前位置”而不是输入框。
     breadcrumbLabel: '当前位置',
     shareTitle: '共享目录',
-    shareSub: '持有链接者可浏览并上传到此目录；链接视同密码，请勿转发给不可信的人。',
     colName: '名称',
     colSize: '大小',
     colModified: '修改时间',
@@ -457,7 +455,6 @@
     themeTitle: '切换主题',
     langTitle: '切换语言',
     serviceUnreachable: '无法连接服务，请确认 Kerminal 仍在运行。',
-    footNote: 'HTTP 明文传输，不提供加密；下载是否完成由浏览器决定。',
     rootName: '共享根目录',
     'error.unauthorized': '会话已失效，请重新打开分享链接。',
     'error.session_expired': '会话已过期，请重新打开分享链接。',
@@ -484,7 +481,6 @@
   var EN = {
     sessionRemaining: '{time} left',
     sessionChecking: 'Checking session…',
-    plaintext: 'Plain HTTP: people on the same network may see file contents and session details. Use only on a trusted network.',
     connectTitle: 'Connect to shared folder',
     connectBodyPairing: 'Establishing a session with Kerminal…',
     connectBodyMissing: 'Return to the LAN File Transfer panel in Kerminal, copy the share link, and open it again.',
@@ -506,7 +502,6 @@
     disconnectHint: 'Ends this page\'s connection to the shared folder. No files are deleted.',
     breadcrumbLabel: 'Current location',
     shareTitle: 'Shared folder',
-    shareSub: 'Anyone with the link can browse and upload here. Treat the link as a password and do not forward it.',
     colName: 'Name',
     colSize: 'Size',
     colModified: 'Modified',
@@ -551,7 +546,6 @@
     themeTitle: 'Switch theme',
     langTitle: 'Switch language',
     serviceUnreachable: 'Cannot reach the service. Make sure Kerminal is still running.',
-    footNote: 'Plain HTTP, no encryption; whether a download is saved is decided by the browser.',
     rootName: 'Shared root',
     'error.unauthorized': 'Session is no longer valid. Reopen the share link.',
     'error.session_expired': 'Session expired. Reopen the share link.',
@@ -671,8 +665,6 @@
       langBtn: byId('lang-btn'),
       themeBtn: byId('theme-btn'),
       disconnectBtn: byId('disconnect-btn'),
-      plaintextNotice: byId('plaintext-notice'),
-      plaintextText: byId('plaintext-text'),
       connectView: byId('connect-view'),
       connectSpinner: byId('connect-spinner'),
       connectTitle: byId('connect-title'),
@@ -683,7 +675,6 @@
       browseBannerText: byId('browse-banner-text'),
       browseBannerAction: byId('browse-banner-action'),
       shareTitle: byId('share-title'),
-      shareSub: byId('share-sub'),
       breadcrumbs: byId('breadcrumbs'),
       uploadBtn: byId('upload-btn'),
       fileInput: byId('file-input'),
@@ -794,7 +785,6 @@
         localized[i].textContent = t(localized[i].getAttribute('data-i18n'));
       }
 
-      els.plaintextText.textContent = t('plaintext');
       els.connectRetry.textContent = t('retry');
       els.disconnectBtn.textContent = t('disconnect');
       // “断开”紧邻语言/主题按钮，需说明断开的对象与无害性；用 title/aria 承载完整说明，
@@ -803,7 +793,6 @@
       els.disconnectBtn.setAttribute('aria-label', t('disconnect') + ': ' + t('disconnectHint'));
       // 面包屑只有文件夹名时像输入框；用本地化的导航名称表明这是“当前位置”。
       els.breadcrumbs.setAttribute('aria-label', t('breadcrumbLabel'));
-      els.shareSub.textContent = t('shareSub');
       els.uploadBtn.textContent = t('selectFiles');
       els.uploadHint.textContent = t('dropHint');
       els.uploadsTitle.textContent = t('uploadsTitle');
@@ -2561,8 +2550,6 @@
       : localeFromNavigator(win.navigator ? win.navigator.language : ''));
 
     bindEvents();
-
-    setHidden(els.plaintextNotice, win.location.protocol !== 'http:');
 
     // 片段在任何网络请求前移除：它只用于配对，不应留在地址栏、历史记录或转发内容里。
     var rawHash = win.location.hash || '';

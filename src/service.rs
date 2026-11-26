@@ -144,7 +144,7 @@ impl Running {
 /// 存在的理由：`serve` 一旦返回，监听任务就已经 `spawn` 到运行时；若此后 `start`
 /// 的 future 被取消（SDK 取消 `view.action`）或状态写入失败，句柄还没进入
 /// `self.running`，普通返回路径不会执行，任务会永久脱离管理并继续对外服务。
-/// 守卫在 drop 时撤销会话、请求关闭并中止任务；`into_running` 是唯一解除武装的出口。
+/// 守卫在 drop 时撤销会话、请求关闭并中止任务；`take_running` 是唯一解除武装的出口。
 ///
 /// 取消路径不能 `await`，因此不能把句柄登记进异步槽位再确认。这里改为把已中止的
 /// 句柄放进**独立的中止遗留列表**：`std::sync::Mutex` 的锁只覆盖一次 push，
@@ -194,7 +194,7 @@ impl DetachedService {
     /// 这样「句柄已离开守卫、尚未登记」之间没有取消点：若在等槽位锁时被取消，
     /// 守卫仍持有任务，drop 会撤销会话并中止它；若守卫在这里就解除武装，
     /// 取消会留下一个既不在槽里、也无人中止的监听任务。
-    fn into_running(&mut self) -> Option<Running> {
+    fn take_running(&mut self) -> Option<Running> {
         let task = self.task.take()?;
         Some(Running {
             shutdown: self.shutdown.take(),
@@ -475,17 +475,28 @@ impl Controller {
         // 可能已经变化，沿用创建时的旧列表会生成打不开的链接；白名单随后固定，
         // 运行中换网卡需要重启服务。单地址监听保持原有逐字校验，不因为引入通配
         // 分支而放宽任何具体地址的 Host/Origin 检查。
-        let (advertised, hosts) = if ip == IpAddr::V4(Ipv4Addr::UNSPECIFIED) {
+        // 通配启动时同时冻结「展示用地址选项」：它们与 Host 白名单来自同一份
+        // 网卡样本、同一个端口，运行期切换 IP 只改链接与二维码，不再重新枚举。
+        let (advertised, hosts, wildcard_runtime) = if ip == IpAddr::V4(Ipv4Addr::UNSPECIFIED) {
             let addresses = crate::net::list_addresses();
             let ipv4 = crate::net::advertised_ipv4(&addresses);
             let allowed = crate::net::ipv4_allowlist(&addresses);
-            let advertised = SocketAddr::new(IpAddr::V4(ipv4), bound.port());
+            let port = bound.port();
+            let advertised = SocketAddr::new(IpAddr::V4(ipv4), port);
+            let options = crate::state::active_ip_options(&addresses, &allowed, port);
             (
                 advertised,
-                crate::http::HostPolicy::wildcard(bound.port(), allowed),
+                crate::http::HostPolicy::wildcard(port, allowed.clone()),
+                Some(crate::state::WildcardRuntime {
+                    port,
+                    secret: secret.clone(),
+                    active_ip: ipv4,
+                    options,
+                    allowed,
+                }),
             )
         } else {
-            (bound, crate::http::HostPolicy::single(bound))
+            (bound, crate::http::HostPolicy::single(bound), None)
         };
         let link = format!("http://{advertised}/#{secret}");
         let qr = render_qr(&link)?;
@@ -530,24 +541,32 @@ impl Controller {
         if let Some(detail) = finished {
             return Err(AppError::new(ErrorCode::Server, detail));
         }
-        if let Err(error) =
-            self.state
-                .mark_running(advertised, link.clone(), root_label, qr, expires_at)
-        {
-            // 状态写入失败时不能让已经启动的监听任务脱离管理：守卫 drop 时会撤销
-            // 会话、请求关闭并中止任务。
-            return Err(error);
-        }
+        let marked = match wildcard_runtime {
+            Some(runtime) => self.state.mark_running_wildcard(
+                advertised,
+                link.clone(),
+                root_label,
+                qr,
+                expires_at,
+                runtime,
+            ),
+            None => self
+                .state
+                .mark_running(advertised, link.clone(), root_label, qr, expires_at),
+        };
+        // 状态写入失败时不能让已经启动的监听任务脱离管理：守卫 drop 时会撤销
+        // 会话、请求关闭并中止任务。
+        marked?;
         // 监听任务在登记之后仍可能自行失败（例如运行期 accept/IO 错误）。控制器此时
         // 不再主动等待它，因此任务自身会在状态仍为 `Running` 时落到 `Failed`
         // （见 `http::serve`）；停止流程把状态改成 `Stopping` 后该回调会被忽略，
         // 不会覆盖用户成功的停止。
-        // 先拿到槽位锁，再交接句柄：`into_running` 之后不能有 await 点。
+        // 先拿到槽位锁，再交接句柄：`take_running` 之后不能有 await 点。
         // 若先交接再等锁，等待期间 future 被取消会把局部 `Running` 丢掉，
         // `JoinHandle` 的 Drop 只 detach，任务从此既不在槽里也无人中止；
         // 反过来先等锁时守卫仍持有任务，取消会撤销会话并中止它。
         let mut slot = self.running.lock().await;
-        let Some(running) = service.into_running() else {
+        let Some(running) = service.take_running() else {
             // 句柄缺失说明启动流程被破坏；不能留下「状态运行中但没有句柄」的局面。
             drop(slot);
             self.mark_stop_failed();
@@ -888,7 +907,10 @@ fn open_root(path: &Path) -> Result<ShareRoot, AppError> {
 }
 
 /// 生成无静区二维码矩阵；边长必须满足宿主校验的 `21 + 4n` 形式。
-fn render_qr(link: &str) -> Result<String, AppError> {
+///
+/// 对 crate 内可见：通配运行期切换展示 IP 时，`state` 需要用同一套编码规则
+/// 立即重建二维码；分开实现会让两处矩阵格式漂移，宿主可能只接受其中一种。
+pub(crate) fn render_qr(link: &str) -> Result<String, AppError> {
     let code = qrcode::QrCode::new(link.as_bytes())
         .map_err(|_| AppError::new(ErrorCode::Server, "qr encode failed"))?;
     let width = code.width();

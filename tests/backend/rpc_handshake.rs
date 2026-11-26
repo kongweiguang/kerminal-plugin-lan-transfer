@@ -561,3 +561,167 @@ async fn wildcard_requires_explicit_selection_and_stays_in_runtime() {
     receive(&mut read).await;
     assert!(task.await.unwrap().is_ok());
 }
+
+/// 通配运行期切换展示 IP：只更新 address/link/qr，不重启监听、不换端口或密钥。
+///
+/// 这里直接走真实协议动作，锁定面板依赖的 `wildcard` / `active_ip` /
+/// `active_ip_options` 数据形状与错误码；剪贴板兜底路径由 e2e 覆盖。
+#[tokio::test]
+async fn wildcard_runtime_switches_active_ip_in_place() {
+    let root = tempfile::tempdir().unwrap();
+    let share = root.path().join("share");
+    std::fs::create_dir(&share).unwrap();
+    let controller = Controller::new();
+    let (host, plugin) = tokio::io::duplex(16 * 1024);
+    let (plugin_read, plugin_write) = tokio::io::split(plugin);
+    let task = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        async move { serve(&controller, plugin_read, plugin_write).await }
+    });
+    let (read, mut write) = tokio::io::split(host);
+    let mut read = BufReader::new(read);
+    send(&mut write, initialize("h:1")).await;
+    receive(&mut read).await;
+
+    send(
+        &mut write,
+        json!({
+            "jsonrpc":"2.0",
+            "id":"h:2",
+            "method":"view.action",
+            "params":{
+                "instance":"w1",
+                "action":"start",
+                "data":{
+                    "root_path": share.to_str().unwrap(),
+                    "selected_address": "0.0.0.0"
+                }
+            }
+        }),
+    )
+    .await;
+    let reply = receive(&mut read).await;
+    assert!(reply["error"].is_null(), "wildcard start failed: {reply}");
+    let patch = &reply["result"]["patch"];
+    assert_eq!(patch["running"], true);
+    assert_eq!(patch["wildcard"], true);
+    assert_eq!(patch["single_address"], false);
+    let options = patch["active_ip_options"].as_array().unwrap();
+    assert!(
+        !options.is_empty(),
+        "wildcard run must expose address options"
+    );
+    let active_ip = patch["active_ip"].as_str().expect("active ip");
+    assert_eq!(active_ip, options[0]["value"].as_str().unwrap());
+    let address = patch["address"].as_str().expect("address");
+    let port = address.rsplit(':').next().unwrap().parse::<u16>().unwrap();
+    assert_eq!(address, format!("{active_ip}:{port}"));
+    assert!(
+        patch["link"]
+            .as_str()
+            .is_some_and(|link| link.starts_with(&format!("http://{active_ip}:{port}/#"))),
+        "link must use the same active address and port"
+    );
+    assert!(options.iter().all(|option| {
+        option["label"]
+            .as_str()
+            .unwrap()
+            .contains(&format!(":{port}"))
+    }));
+    let qr_before = patch["qr"].clone();
+
+    // 白名单外地址属于输入错误：不能悄悄切换或返回成功。
+    send(
+        &mut write,
+        json!({
+            "jsonrpc":"2.0",
+            "id":"h:3",
+            "method":"view.action",
+            "params":{
+                "instance":"w1",
+                "action":"select-active-ip",
+                "data":{"active_ip":"203.0.113.9"}
+            }
+        }),
+    )
+    .await;
+    let (reply, _) = receive_with_notifications(&mut read).await;
+    assert_eq!(reply["error"]["code"], -32104, "{reply}");
+    assert_eq!(controller.state.snapshot().unwrap().active_ip, active_ip);
+
+    // 选择当前地址是幂等动作：二维码与代次都不变。
+    send(
+        &mut write,
+        json!({
+            "jsonrpc":"2.0",
+            "id":"h:4",
+            "method":"view.action",
+            "params":{
+                "instance":"w1",
+                "action":"select-active-ip",
+                "data":{"active_ip": active_ip}
+            }
+        }),
+    )
+    .await;
+    let reply = receive(&mut read).await;
+    assert!(reply["error"].is_null(), "{reply}");
+    assert_eq!(reply["result"]["patch"]["active_ip"], active_ip);
+    assert_eq!(reply["result"]["patch"]["qr"], qr_before);
+
+    // 有第二个地址时才可验证真实切换；测试机只有回环时这一分支自然不会执行。
+    if options.len() >= 2 {
+        let target = options.last().unwrap()["value"].as_str().unwrap();
+        send(
+            &mut write,
+            json!({
+                "jsonrpc":"2.0",
+                "id":"h:5",
+                "method":"view.action",
+                "params":{
+                    "instance":"w1",
+                    "action":"select-active-ip",
+                    "data":{"active_ip": target}
+                }
+            }),
+        )
+        .await;
+        let reply = receive(&mut read).await;
+        assert!(reply["error"].is_null(), "switch failed: {reply}");
+        let patch = &reply["result"]["patch"];
+        assert_eq!(patch["active_ip"], target);
+        assert_eq!(patch["address"], format!("{target}:{port}"));
+        assert_eq!(patch["wildcard"], true);
+        assert_ne!(patch["qr"], qr_before, "qr must follow the switched link");
+        assert!(
+            patch["link"]
+                .as_str()
+                .is_some_and(|link| link.starts_with(&format!("http://{target}:{port}/#"))),
+            "link must not keep the previous address"
+        );
+        let snapshot = controller.state.snapshot().unwrap();
+        assert_eq!(snapshot.phase, Phase::Running);
+        assert_eq!(snapshot.active_ip, target);
+    }
+
+    send(
+        &mut write,
+        json!({"jsonrpc":"2.0","id":"h:6","method":"view.action",
+               "params":{"instance":"w1","action":"stop","data":{}}}),
+    )
+    .await;
+    assert!(receive(&mut read).await["error"].is_null());
+    // 停止后运行期网络字段必须立即清空。
+    let stopped = controller.state.snapshot().unwrap();
+    assert!(!stopped.wildcard);
+    assert!(stopped.active_ip.is_empty());
+    assert!(stopped.active_ip_options.is_empty());
+
+    send(
+        &mut write,
+        json!({"jsonrpc":"2.0","id":"h:7","method":"shutdown","params":{}}),
+    )
+    .await;
+    receive(&mut read).await;
+    assert!(task.await.unwrap().is_ok());
+}

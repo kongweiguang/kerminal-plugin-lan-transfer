@@ -92,10 +92,7 @@ async fn store(
     // 守卫持有父目录句柄、暂存名与写句柄的独立克隆；`disarm()` 之后不再删除。
     // 身份克隆必须在写句柄交出去之前完成：清理时要证明「目录项仍是本请求创建的
     // 那个文件对象」，只能拿创建时同一 inode 的句柄来比较，事后按名重开没有意义。
-    let identity = staging
-        .file
-        .try_clone()
-        .map_err(|error| AppError::io(error))?;
+    let identity = staging.file.try_clone().map_err(AppError::io)?;
     let mut guard = StagingGuard::new(&staging.dir, staging.staging.clone(), identity);
     // 同步句柄转成 tokio 文件才能用异步读写；底层仍是同一个打开的文件对象。
     let mut file = tokio::fs::File::from_std(staging.file);
@@ -150,7 +147,11 @@ struct StagingGuard<'a> {
 }
 
 impl<'a> StagingGuard<'a> {
-    fn new(handle: &'a crate::fs_root::DirHandle, staging: String, identity: std::fs::File) -> Self {
+    fn new(
+        handle: &'a crate::fs_root::DirHandle,
+        staging: String,
+        identity: std::fs::File,
+    ) -> Self {
         Self {
             handle,
             staging,

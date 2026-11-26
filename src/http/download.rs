@@ -137,7 +137,9 @@ pub async fn download(
     let mut file = tokio::fs::File::from_std(opened.file);
     // 区间起点通过同一句柄 seek 得到：不重新打开文件，避免路径被替换后偏移
     // 落到另一个对象上。seek 失败按内部错误返回，不静默发送错位字节。
-    if offset != 0 && let Err(error) = file.seek(SeekFrom::Start(offset)).await {
+    if offset != 0
+        && let Err(error) = file.seek(SeekFrom::Start(offset)).await
+    {
         return error_response(AppError::io(error));
     }
     // 按本次响应的字节长度截断：Range 只 seek 到起点而不限制读取会把文件剩余部分
@@ -163,8 +165,7 @@ pub async fn download(
             ),
             (
                 header::CONTENT_LENGTH,
-                HeaderValue::from_str(&length.to_string())
-                    .unwrap_or(HeaderValue::from_static("0")),
+                HeaderValue::from_str(&length.to_string()).unwrap_or(HeaderValue::from_static("0")),
             ),
             (header::ACCEPT_RANGES, HeaderValue::from_static("bytes")),
         ],
@@ -279,9 +280,8 @@ fn remap_file_error(error: AppError) -> AppError {
 /// 一次，换来的是无 unsafe 的 `Stream` 实现；`GuardedStream` 因此保持 `Unpin`，
 /// 可以直接在 `Pin<&mut Self>` 上访问字段。
 struct GuardedStream {
-    inner: std::pin::Pin<
-        Box<dyn Stream<Item = std::io::Result<axum::body::Bytes>> + Send + 'static>,
-    >,
+    inner:
+        std::pin::Pin<Box<dyn Stream<Item = std::io::Result<axum::body::Bytes>> + Send + 'static>>,
     _in_flight: crate::http::InFlightGuard,
 }
 
@@ -346,7 +346,10 @@ mod tests {
     /// 不可满足区间：起点不小于长度、空文件、零长度后缀。
     #[test]
     fn flags_unsatisfiable_ranges() {
-        assert!(matches!(range("bytes=16-", 16), RangeRequest::Unsatisfiable));
+        assert!(matches!(
+            range("bytes=16-", 16),
+            RangeRequest::Unsatisfiable
+        ));
         assert!(matches!(
             range("bytes=99-100", 16),
             RangeRequest::Unsatisfiable
@@ -373,10 +376,16 @@ mod tests {
             );
         }
         // 没有 Range 头也是整份返回。
-        assert!(matches!(parse_range(&HeaderMap::new(), 16), RangeRequest::Full));
+        assert!(matches!(
+            parse_range(&HeaderMap::new(), 16),
+            RangeRequest::Full
+        ));
         // 非 ASCII 头无法解释，同样忽略。
         let mut headers = HeaderMap::new();
-        headers.insert(header::RANGE, HeaderValue::from_bytes(b"bytes=\xff").unwrap());
+        headers.insert(
+            header::RANGE,
+            HeaderValue::from_bytes(b"bytes=\xff").unwrap(),
+        );
         assert!(matches!(parse_range(&headers, 16), RangeRequest::Full));
     }
 }

@@ -41,6 +41,25 @@ pub struct AddressOption {
     pub value: String,
 }
 
+/// 通配监听本次启动冻结的运行时信息。
+///
+/// 只保存在内存里：端口、配对密钥与 Host 白名单都以启动那一刻为准，切换展示
+/// 地址不重新绑定、不换密钥。停止、失败与下一次启动前必须清空，避免旧密钥
+/// 经任何快照路径回到宿主或日志。
+#[derive(Clone, Debug)]
+pub struct WildcardRuntime {
+    /// 本次实际绑定的端口；切换地址时链接与二维码必须沿用同一个端口。
+    pub port: u16,
+    /// 本次运行的配对密钥；切换地址不得更换，否则已打开的链接会立即失效。
+    pub secret: String,
+    /// 当前对外展示的 IPv4。
+    pub active_ip: Ipv4Addr,
+    /// 与 `allowed` 一一对应的下拉选项，标签里带端口。
+    pub options: Vec<AddressOption>,
+    /// 与 `HostPolicy::wildcard` 同源的 IPv4 白名单。
+    pub allowed: Vec<Ipv4Addr>,
+}
+
 /// 对外快照；字段名即视图绑定名，增删字段需同步视图文件与状态版本。
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
@@ -64,6 +83,14 @@ pub struct Snapshot {
     /// 可直接展示的状态行与错误行（已本地化）。
     pub status: String,
     pub error: Option<String>,
+    /// 仅在运行中的通配监听为 true；非运行态不得泄露本次启动的网络信息。
+    pub wildcard: bool,
+    /// `wildcard` 的反向布尔量，供视图在两种地址展示形态之间切换。
+    pub single_address: bool,
+    /// 当前对外展示的 IPv4；非通配运行态为空串。
+    pub active_ip: String,
+    /// 通配运行期的地址下拉；其他阶段为空。
+    pub active_ip_options: Vec<AddressOption>,
     pub uploaded: u64,
     pub downloaded: u64,
     pub started_at: Option<u64>,
@@ -86,6 +113,8 @@ struct Inner {
     selected_address: String,
     addresses: Vec<ListenAddress>,
     error: Option<String>,
+    /// 通配运行的冻结信息；只有 `Running` 且以 `0.0.0.0` 监听时才存在。
+    wildcard_runtime: Option<WildcardRuntime>,
     uploaded: u64,
     downloaded: u64,
     started_at: Option<u64>,
@@ -113,6 +142,7 @@ impl State {
                 selected_address: selected,
                 addresses,
                 error: None,
+                wildcard_runtime: None,
                 uploaded: 0,
                 downloaded: 0,
                 started_at: None,
@@ -127,6 +157,10 @@ impl State {
             .inner
             .lock()
             .map_err(|_| crate::error::AppError::new(ErrorCode::Server, "state unavailable"))?;
+        let runtime = inner.wildcard_runtime.as_ref();
+        // 网络信息只在「运行中的通配监听」这一种情况下可见：空闲、启动中、
+        // 停止中与失败态都不携带端口/密钥/白名单，避免旧值经视图补丁泄露。
+        let wildcard = inner.phase == Phase::Running && runtime.is_some();
         Ok(Snapshot {
             phase: inner.phase,
             root_path: inner.root_path.clone(),
@@ -143,6 +177,24 @@ impl State {
             address_options: address_options(&inner.addresses),
             status: status_text(inner.phase).to_owned(),
             error: inner.error.clone(),
+            wildcard,
+            single_address: !wildcard,
+            // 运行期网络信息与 `wildcard` 同生共死：`Stopping` 时句柄仍在回收，
+            // 但链接即将失效，继续展示会诱导用户复制一个马上不可用的地址。
+            active_ip: if wildcard {
+                runtime
+                    .map(|runtime| runtime.active_ip.to_string())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            },
+            active_ip_options: if wildcard {
+                runtime
+                    .map(|runtime| runtime.options.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            },
             uploaded: inner.uploaded,
             downloaded: inner.downloaded,
             started_at: inner.started_at,
@@ -221,6 +273,9 @@ impl State {
         inner.address = None;
         inner.link = None;
         inner.qr = None;
+        // 上一次运行冻结的端口、密钥与白名单不能延续到本次启动：新监听会重新
+        // 分配端口和密钥，旧值留在内存里只会成为误导性的过期事实。
+        inner.wildcard_runtime = None;
         inner.expires_at = None;
         inner.started_at = None;
         inner.error = None;
@@ -241,6 +296,35 @@ impl State {
         qr: String,
         expires_at: u64,
     ) -> AppResult<()> {
+        self.mark_running_share(address, link, root_name, qr, expires_at, None)
+    }
+
+    /// 通配监听启动成功：除常规展示字段外，记录本次冻结的端口、密钥与白名单。
+    ///
+    /// 与单地址启动共用同一段状态校验，避免两条路径对「是否仍在 `Starting`」
+    /// 产生不同判断；差异只在是否携带运行期网络信息。
+    pub fn mark_running_wildcard(
+        &self,
+        address: SocketAddr,
+        link: String,
+        root_name: String,
+        qr: String,
+        expires_at: u64,
+        runtime: WildcardRuntime,
+    ) -> AppResult<()> {
+        self.mark_running_share(address, link, root_name, qr, expires_at, Some(runtime))
+    }
+
+    /// 启动成功的共同实现；`runtime` 为 `None` 表示单地址监听。
+    fn mark_running_share(
+        &self,
+        address: SocketAddr,
+        link: String,
+        root_name: String,
+        qr: String,
+        expires_at: u64,
+        runtime: Option<WildcardRuntime>,
+    ) -> AppResult<()> {
         let mut inner = self.lock()?;
         if inner.phase != Phase::Starting {
             return Err(crate::error::AppError::new(
@@ -253,9 +337,56 @@ impl State {
         inner.link = Some(link);
         inner.root_name = Some(root_name);
         inner.qr = Some(qr);
+        inner.wildcard_runtime = runtime;
         inner.expires_at = Some(expires_at);
         inner.started_at = Some(now_unix());
         inner.error = None;
+        Ok(())
+    }
+
+    /// 在本次通配运行冻结的白名单内切换对外展示的 IPv4。
+    ///
+    /// 只改 `address`/`link`/`qr` 与选中值，不重新绑定端口、不更换密钥，因此
+    /// 已建立的会话、票据与在途传输都不受影响。地址必须来自启动时与
+    /// `HostPolicy::wildcard` 同源的白名单：否则面板会展示一个 Host 校验根本
+    /// 不接受的地址，二维码扫出来也是打不开的链接。
+    pub fn select_active_ip(&self, value: &str) -> AppResult<()> {
+        let mut inner = self.lock()?;
+        if inner.phase != Phase::Running {
+            return Err(crate::error::AppError::new(
+                ErrorCode::Unavailable,
+                "not running",
+            ));
+        }
+        let ip = value
+            .trim()
+            .parse::<Ipv4Addr>()
+            .map_err(|_| crate::error::AppError::new(ErrorCode::BadRequest, "invalid address"))?;
+        let (port, secret) = {
+            let runtime = inner.wildcard_runtime.as_ref().ok_or_else(|| {
+                crate::error::AppError::new(ErrorCode::BadRequest, "not wildcard")
+            })?;
+            if !runtime.allowed.contains(&ip) {
+                return Err(crate::error::AppError::new(
+                    ErrorCode::BadRequest,
+                    "address not in active addresses",
+                ));
+            }
+            if runtime.active_ip == ip {
+                return Ok(());
+            }
+            (runtime.port, runtime.secret.clone())
+        };
+        // 先构造新值再写回：二维码生成失败时保持原地址可用，不会留下
+        // 「active_ip 已换、qr 仍是旧值」的半更新状态。
+        let link = format!("http://{ip}:{port}/#{secret}");
+        let qr = crate::service::render_qr(&link)?;
+        if let Some(runtime) = inner.wildcard_runtime.as_mut() {
+            runtime.active_ip = ip;
+        }
+        inner.address = Some(SocketAddr::new(IpAddr::V4(ip), port));
+        inner.link = Some(link);
+        inner.qr = Some(qr);
         Ok(())
     }
 
@@ -266,6 +397,7 @@ impl State {
         inner.address = None;
         inner.link = None;
         inner.qr = None;
+        inner.wildcard_runtime = None;
         inner.expires_at = None;
         inner.error = Some(message);
         Ok(())
@@ -287,6 +419,9 @@ impl State {
             return Err(crate::error::AppError::new(ErrorCode::Busy, "service busy"));
         }
         inner.phase = Phase::Stopping;
+        // 进入停止即撤销运行期网络信息：链接与二维码从这一刻起不再可信，
+        // 视图也不应继续提供地址切换或复制入口。
+        inner.wildcard_runtime = None;
         Ok(true)
     }
 
@@ -297,6 +432,7 @@ impl State {
         inner.address = None;
         inner.link = None;
         inner.qr = None;
+        inner.wildcard_runtime = None;
         inner.expires_at = None;
         inner.started_at = None;
         Ok(())
@@ -321,6 +457,7 @@ impl State {
         inner.address = None;
         inner.link = None;
         inner.qr = None;
+        inner.wildcard_runtime = None;
         inner.expires_at = None;
         inner.started_at = None;
         inner.error = Some(message);
@@ -342,6 +479,7 @@ impl State {
             inner.address = None;
             inner.link = None;
             inner.qr = None;
+            inner.wildcard_runtime = None;
             inner.expires_at = None;
             inner.started_at = None;
         }
@@ -361,6 +499,7 @@ impl State {
             inner.address = None;
             inner.link = None;
             inner.qr = None;
+            inner.wildcard_runtime = None;
             inner.expires_at = None;
             inner.started_at = None;
             inner.error = Some(message);
@@ -461,6 +600,39 @@ fn address_options(addresses: &[ListenAddress]) -> Vec<AddressOption> {
         value: WILDCARD_ADDRESS.to_owned(),
     });
     options
+}
+
+/// 生成通配运行期的地址下拉选项。
+///
+/// `allowed` 必须与 `HostPolicy::wildcard` 使用同一份白名单，顺序也直接沿用
+/// `list_addresses` 的排序（物理网卡、虚拟网卡、回环），因此下拉里出现的地址
+/// 就是 Host 校验会接受的地址，且默认第一项不会落在 WSL/Docker 等虚拟网卡上。
+/// 标签固定带端口，用户切换后能立刻确认二维码与复制链接指向哪个监听端点。
+pub fn active_ip_options(
+    addresses: &[ListenAddress],
+    allowed: &[Ipv4Addr],
+    port: u16,
+) -> Vec<AddressOption> {
+    let locale = Locale::detect();
+    allowed
+        .iter()
+        .map(|ip| {
+            let label = if ip.is_loopback() {
+                locale.text(Key::ActiveIpLoopback).to_owned()
+            } else {
+                addresses
+                    .iter()
+                    .find(|address| address.ip == IpAddr::V4(*ip))
+                    .map(|address| address.label.clone())
+                    .filter(|label| !label.is_empty() && label != "loopback")
+                    .unwrap_or_else(|| ip.to_string())
+            };
+            AddressOption {
+                label: format!("{ip}:{port} · {label}"),
+                value: ip.to_string(),
+            }
+        })
+        .collect()
 }
 
 /// 状态行文案；与 `l10n::Key` 保持同一套措辞。
@@ -732,5 +904,155 @@ mod tests {
         }
         state.count_upload();
         assert_eq!(state.snapshot().unwrap().uploaded, u64::MAX);
+    }
+
+    /// 构造一个通配运行态；白名单与选项使用固定地址，避免测试依赖真实网卡。
+    fn wildcard_state() -> Arc<State> {
+        let state = State::new();
+        state.select_address("0.0.0.0").unwrap();
+        state.begin_start().unwrap();
+        let runtime = WildcardRuntime {
+            port: 65395,
+            secret: "Ab3xY9_qLmN0pQrS".into(),
+            active_ip: Ipv4Addr::new(192, 168, 1, 10),
+            options: vec![
+                AddressOption {
+                    label: "192.168.1.10:65395 · Ethernet".into(),
+                    value: "192.168.1.10".into(),
+                },
+                AddressOption {
+                    label: "127.0.0.1:65395 · 仅本机".into(),
+                    value: "127.0.0.1".into(),
+                },
+            ],
+            allowed: vec![Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::LOCALHOST],
+        };
+        state
+            .mark_running_wildcard(
+                "192.168.1.10:65395".parse().unwrap(),
+                "http://192.168.1.10:65395/#Ab3xY9_qLmN0pQrS".into(),
+                "share".into(),
+                "qr-old".into(),
+                10,
+                runtime,
+            )
+            .unwrap();
+        state
+    }
+
+    /// 切换展示 IP 必须复用同一端口与密钥，并同步更新地址、链接和二维码；
+    /// 阶段保持 `Running`，证明没有重启监听或断开会话。
+    #[test]
+    fn select_active_ip_switches_link_and_qr_in_place() {
+        let state = wildcard_state();
+        let before = state.snapshot().unwrap();
+        assert!(before.wildcard && !before.single_address);
+        assert_eq!(before.active_ip, "192.168.1.10");
+        assert_eq!(before.active_ip_options.len(), 2);
+        assert_eq!(before.address.as_deref(), Some("192.168.1.10:65395"));
+        let started_at = before.started_at;
+        let expires_at = before.expires_at;
+
+        state.select_active_ip("127.0.0.1").unwrap();
+        let after = state.snapshot().unwrap();
+        assert_eq!(after.phase, Phase::Running);
+        assert_eq!(after.active_ip, "127.0.0.1");
+        assert_eq!(after.address.as_deref(), Some("127.0.0.1:65395"));
+        assert_eq!(
+            after.link.as_deref(),
+            Some("http://127.0.0.1:65395/#Ab3xY9_qLmN0pQrS"),
+            "port and secret must be reused"
+        );
+        assert!(after.qr.is_some());
+        assert_ne!(after.qr, before.qr, "qr must follow the new link");
+        assert_eq!(after.started_at, started_at);
+        assert_eq!(after.expires_at, expires_at);
+    }
+
+    /// 白名单外、非法格式、单地址模式与未运行状态都必须拒绝，不能悄悄显示
+    /// 一个 Host 校验不接受的地址。
+    #[test]
+    fn select_active_ip_rejects_outside_frozen_allowlist() {
+        let state = wildcard_state();
+        assert_eq!(
+            state.select_active_ip("203.0.113.9").unwrap_err().code,
+            ErrorCode::BadRequest
+        );
+        assert_eq!(
+            state.select_active_ip("not-an-ip").unwrap_err().code,
+            ErrorCode::BadRequest
+        );
+        // 非法输入不能改变当前展示地址。
+        assert_eq!(state.snapshot().unwrap().active_ip, "192.168.1.10");
+
+        state.begin_stop(true).unwrap();
+        state.mark_idle().unwrap();
+        assert_eq!(
+            state.select_active_ip("127.0.0.1").unwrap_err().code,
+            ErrorCode::Unavailable
+        );
+
+        // 单地址监听没有运行期白名单，切换动作必须拒绝而不是静默成功。
+        let single = idle();
+        single.begin_start().unwrap();
+        single
+            .mark_running(
+                "127.0.0.1:1234".parse().unwrap(),
+                "link".into(),
+                "share".into(),
+                "qr".into(),
+                10,
+            )
+            .unwrap();
+        assert_eq!(
+            single.select_active_ip("127.0.0.1").unwrap_err().code,
+            ErrorCode::BadRequest
+        );
+    }
+
+    /// 停止后不得留下端口、密钥、白名单或选项；快照只能看到回退后的选中输入值。
+    #[test]
+    fn stop_clears_wildcard_runtime() {
+        let state = wildcard_state();
+        state.begin_stop(true).unwrap();
+        let stopping = state.snapshot().unwrap();
+        assert!(!stopping.wildcard);
+        assert!(stopping.single_address);
+        assert!(stopping.active_ip.is_empty());
+        assert!(stopping.active_ip_options.is_empty());
+        state.mark_idle().unwrap();
+        let idle = state.snapshot().unwrap();
+        assert!(idle.active_ip.is_empty());
+        assert!(idle.active_ip_options.is_empty());
+        assert!(idle.address.is_none() && idle.qr.is_none());
+        // 用户显式选择的全接口输入仍保留，供下次启动使用。
+        assert_eq!(idle.selected_address, "0.0.0.0");
+    }
+
+    /// 选项顺序沿用白名单顺序，标签必须带端口；回环使用本地化「仅本机」。
+    #[test]
+    fn active_ip_options_follow_allowlist_and_include_port() {
+        let addresses = vec![
+            ListenAddress {
+                ip: "192.168.1.10".parse().unwrap(),
+                label: "Ethernet".into(),
+            },
+            ListenAddress {
+                ip: "127.0.0.1".parse().unwrap(),
+                label: "loopback".into(),
+            },
+        ];
+        let allowed = vec![Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::LOCALHOST];
+        let options = active_ip_options(&addresses, &allowed, 65395);
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].value, "192.168.1.10");
+        assert_eq!(options[0].label, "192.168.1.10:65395 · Ethernet");
+        assert_eq!(options[1].value, "127.0.0.1");
+        assert!(options[1].label.contains("127.0.0.1:65395"));
+        assert!(
+            options[1]
+                .label
+                .contains(Locale::detect().text(Key::ActiveIpLoopback))
+        );
     }
 }

@@ -50,11 +50,7 @@ pub fn remove_child(_dir: &DirHandle, _name: &str) -> io::Result<()> {
 
 /// 保守平台没有可用的目录项操作，身份绑定清理同样拒绝；`Ok(false)` 会让调用方
 /// 误以为「名字已换，保留材料」是正常结果，掩盖平台不支持的事实。
-pub fn remove_staging_if_owned(
-    _dir: &DirHandle,
-    _name: &str,
-    _owned: &File,
-) -> io::Result<bool> {
+pub fn remove_staging_if_owned(_dir: &DirHandle, _name: &str, _owned: &File) -> io::Result<bool> {
     Err(unsupported())
 }
 

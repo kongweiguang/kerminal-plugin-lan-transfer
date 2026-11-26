@@ -156,10 +156,10 @@ class FakeNode {
 /** 以 index.html 的 id 列表预置节点，避免测试里手写整页结构。 */
 const REQUIRED_IDS = [
   'session-chip', 'session-chip-text', 'lang-btn', 'theme-btn', 'disconnect-btn',
-  'plaintext-notice', 'plaintext-text', 'link-notice', 'link-notice-text',
+  'link-notice', 'link-notice-text',
   'link-notice-dismiss', 'connect-view', 'connect-spinner', 'connect-title',
   'connect-body', 'connect-retry', 'browse-view', 'browse-banner', 'browse-banner-text',
-  'browse-banner-action', 'share-title', 'share-sub', 'breadcrumbs', 'upload-btn',
+  'browse-banner-action', 'share-title', 'breadcrumbs', 'upload-btn',
   'file-input', 'upload-hint', 'upload-summary', 'uploads', 'uploads-title', 'cancel-all',
   'clear-done', 'upload-list', 'list-card', 'list-head', 'list-status', 'list-count',
   'list-retry', 'entries', 'list-foot', 'load-more', 'drop-overlay'
@@ -2125,5 +2125,20 @@ test('断开按钮明确连接语义与无害性，但不使用危险样式', as
   assert.ok(tag, '应能找到断开按钮声明');
   assert.match(tag, /btn-ghost/, '断开应是 ghost 按钮');
   assert.doesNotMatch(tag, /danger|destructive|delete/, '断开不得使用危险/删除样式');
+});
+
+test('常驻明文/信任提示与页脚已移除，真实交互提示仍保留', () => {
+  const html = require('node:fs').readFileSync(
+    path.join(__dirname, '..', '..', 'web', 'index.html'), 'utf8');
+  // 用户明确不需要常驻小提示：顶部明文条、标题下说明与页脚都必须彻底移除，
+  // 不能只靠 hidden 藏起来，否则仍会占位或被脚本重新显示。
+  assert.doesNotMatch(html, /plaintext-notice|plaintext-text/);
+  assert.doesNotMatch(html, /id="share-sub"|class="share-sub"/);
+  assert.doesNotMatch(html, /<footer|class="foot"|footNote/);
+  assert.doesNotMatch(html, /HTTP 明文传输/);
+  // 真实交互反馈必须保留：新链接冲突、断线重连、拖拽遮罩。
+  assert.match(html, /id="link-notice"/);
+  assert.match(html, /id="browse-banner"/);
+  assert.match(html, /id="drop-overlay"/);
 });
 

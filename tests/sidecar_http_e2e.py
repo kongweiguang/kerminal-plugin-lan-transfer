@@ -1262,6 +1262,172 @@ class SidecarEndToEnd(unittest.TestCase):
         self._wait_port_closed(port, timeout=2)
         self._assert_no_staging()
 
+    def test_wildcard_active_ip_switch_and_copy(self):
+        """全网卡运行期切换展示 IP：不重启监听，会话仍可用，复制拿到新链接。
+
+        用真实 HTTP 回环连接证明端口与密钥没有变化；选项列表来自启动时冻结的
+        白名单，切换到回环后再用同一个 token 访问列表，覆盖「切换不剔除已建立
+        的会话」这一承诺。若测试机只有回环地址，则只验证非法输入被拒绝。
+        """
+        self._phase("wildcard: start")
+        started = self._expect_ok(
+            self.rpc.request(
+                "view.action",
+                {
+                    "instance": "e2e",
+                    "action": "start",
+                    "data": {
+                        "root_path": str(self.share),
+                        "selected_address": "0.0.0.0",
+                    },
+                },
+                RPC_TIMEOUT,
+            ),
+            "wildcard start",
+        )
+        patch = started["patch"]
+        self.assertTrue(patch["wildcard"])
+        self.assertFalse(patch["single_address"])
+        options = patch["active_ip_options"]
+        self.assertGreaterEqual(len(options), 1, "通配运行必须提供地址选项")
+        active = patch["active_ip"]
+        self.assertEqual(active, options[0]["value"], "默认选中的必须是排序第一项")
+        parts = urllib.parse.urlsplit(patch["link"])
+        port = parts.port
+        secret = parts.fragment
+        self.assertEqual(patch["address"], f"{active}:{port}")
+        self.assertTrue(patch["link"].startswith(f"http://{active}:{port}/#"))
+        for option in options:
+            self.assertIn(f":{port}", option["label"], "选项标签必须带端口")
+            self.assertTrue(option["value"])
+        qr_before = patch["qr"]
+        expires_before = patch["expires_at"]
+
+        # 用回环配对：Host 白名单包含 127.0.0.1，即使当前展示地址是局域网 IP。
+        self.http = HttpApi(port)
+        status, _, data = self.http.pair(secret)
+        paired = self._json(status, data, "wildcard pair")
+        token = paired["token"]
+
+        self._phase("wildcard: reject foreign ip")
+        reply = self.rpc.request(
+            "view.action",
+            {
+                "instance": "e2e",
+                "action": "select-active-ip",
+                "data": {"active_ip": "203.0.113.9"},
+            },
+            RPC_TIMEOUT,
+        )
+        self.assertEqual(reply["error"]["code"], -32104)
+        current = self._expect_ok(
+            self.rpc.request(
+                "view.action",
+                {
+                    "instance": "e2e",
+                    "action": "select-active-ip",
+                    "data": {"active_ip": active},
+                },
+                RPC_TIMEOUT,
+            ),
+            "same active ip",
+        )
+        self.assertEqual(current["patch"]["active_ip"], active)
+        self.assertEqual(current["patch"]["qr"], qr_before, "幂等选择不应改变二维码")
+
+        target = next(
+            (option["value"] for option in options if option["value"] != active),
+            None,
+        )
+        if target is None:
+            # 只有回环：切换分支无法构造，但仍要证明非法复制输入不会写剪贴板。
+            requests_before = self.rpc.clipboard_requests
+            reply, _ = self.rpc.request_with_notifications(
+                "view.action",
+                {
+                    "instance": "e2e",
+                    "action": "copy-link",
+                    "data": {"active_ip": "203.0.113.9"},
+                },
+                RPC_TIMEOUT,
+            )
+            self.assertEqual(reply["error"]["code"], -32104)
+            self.assertEqual(self.rpc.clipboard_requests, requests_before)
+        else:
+            self._phase("wildcard: select another ip")
+            switched = self._expect_ok(
+                self.rpc.request(
+                    "view.action",
+                    {
+                        "instance": "e2e",
+                        "action": "select-active-ip",
+                        "data": {"active_ip": target},
+                    },
+                    RPC_TIMEOUT,
+                ),
+                "select-active-ip",
+            )
+            switched_patch = switched["patch"]
+            self.assertEqual(switched_patch["active_ip"], target)
+            self.assertEqual(switched_patch["address"], f"{target}:{port}")
+            self.assertTrue(switched_patch["link"].startswith(f"http://{target}:{port}/#"))
+            self.assertNotEqual(switched_patch["qr"], qr_before, "二维码必须跟随新地址")
+            self.assertEqual(switched_patch["expires_at"], expires_before)
+
+            self._phase("wildcard: session survives switch")
+            status, _, data = self.http.request(
+                "GET", "/api/list?dir=root", {"Authorization": f"Bearer {token}"}
+            )
+            listed = self._json(status, data, "list after switch")
+            self.assertIn("entries", listed)
+
+            self._phase("wildcard: copy switches back")
+            self.rpc.clipboard_mode = "ack"
+            texts_before = len(self.rpc.clipboard_texts)
+            copied = self._expect_ok(
+                self.rpc.request(
+                    "view.action",
+                    {
+                        "instance": "e2e",
+                        "action": "copy-link",
+                        "data": {"active_ip": active},
+                    },
+                    RPC_TIMEOUT,
+                ),
+                "copy with fallback switch",
+            )
+            copied_patch = copied["patch"]
+            self.assertEqual(copied_patch["active_ip"], active)
+            self.assertEqual(copied_patch["address"], f"{active}:{port}")
+            self.assertNotEqual(copied_patch["qr"], switched_patch["qr"])
+            self.assertTrue(copied_patch["copy_label"])
+            # 剪贴板里必须是切换后的链接；比较布尔结论，失败信息不回显密钥。
+            self.assertEqual(
+                self.rpc.clipboard_texts[texts_before:] == [copied_patch["link"]],
+                True,
+                "clipboard 文本必须等于切换后的 link",
+            )
+            status, _, data = self.http.request(
+                "GET", "/api/list?dir=root", {"Authorization": f"Bearer {token}"}
+            )
+            self._json(status, data, "list after copy switch")
+
+        self._phase("wildcard: stop")
+        stopped = self._expect_ok(
+            self.rpc.request(
+                "view.action", {"instance": "e2e", "action": "stop", "data": {}}, RPC_TIMEOUT
+            ),
+            "wildcard stop",
+        )
+        self.assertFalse(stopped["patch"]["wildcard"])
+        self.assertEqual(stopped["patch"]["active_ip"], "")
+        self.assertEqual(stopped["patch"]["active_ip_options"], [])
+        self._wait_port_closed(port)
+
+        self._phase("wildcard: shutdown")
+        self._expect_ok(self.rpc.request("shutdown", {}, EXIT_TIMEOUT), "shutdown")
+        self.assertEqual(self.rpc.wait_exit(EXIT_TIMEOUT), 0, "shutdown 后必须正常退出")
+
     def test_copy_link_stale_after_other_instance_stop(self):
         """ACK 前的另一窗口 stop 必须让复制失败，且不能回写旧链接或广播确认。
 

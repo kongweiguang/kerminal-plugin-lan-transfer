@@ -36,12 +36,57 @@ pub fn list_addresses() -> Vec<ListenAddress> {
         }
     }
     // 私网地址优先：用户的典型场景是同一局域网，公网/链路本地地址排在后面。
-    result.sort_by_key(|address| rank(address.ip));
+    // 同类地址内再按接口名把虚拟网卡排后，避免默认选中 WSL/Docker/VPN 地址。
+    result.sort_by_key(order_key);
     result.push(ListenAddress {
         ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
         label: "loopback".to_owned(),
     });
     result
+}
+
+/// 常见虚拟/容器/VPN 网卡的接口名片段（小写）。
+///
+/// 只做名称启发式判断，不查询平台适配器类型：名称是跨平台、无需额外权限且
+/// 在 `if-addrs` 里唯一可用的稳定信号。误判的代价只是排序靠后，用户仍能在
+/// 下拉里改选，不会让任何地址从候选中消失。
+const VIRTUAL_INTERFACE_MARKERS: &[&str] = &[
+    "vethernet",
+    "wsl",
+    "hyper-v",
+    "docker",
+    "tailscale",
+    "wireguard",
+    "zerotier",
+    "vmnet",
+    "vmware",
+    "vbox",
+    "virtual",
+    "tun",
+    "tap",
+    "utun",
+    "bridge",
+    "br-",
+    "veth",
+];
+
+/// 接口名是否指向虚拟/容器/VPN 网卡；大小写不敏感。
+fn is_virtual_interface(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    VIRTUAL_INTERFACE_MARKERS
+        .iter()
+        .any(|marker| name.contains(marker))
+}
+
+/// 排序键：先按地址类别，再在同类内把虚拟网卡排到物理网卡之后。
+///
+/// 为什么把虚拟网卡只放在「同类之后」而不是全局最后：公网 IPv4 或 IPv6 的
+/// 优先级仍应高于回环；虚拟网卡只是不该抢在普通以太网/WLAN 前面成为默认项。
+fn order_key(address: &ListenAddress) -> (u8, u8) {
+    (
+        rank(address.ip),
+        u8::from(is_virtual_interface(&address.label)),
+    )
 }
 
 /// 排序权重：私网 IPv4 最前，其次其他 IPv4，再 IPv6，回环最后。
@@ -142,5 +187,50 @@ mod tests {
             vec![Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::LOCALHOST]
         );
         assert!(!allowed.contains(&Ipv4Addr::UNSPECIFIED));
+    }
+
+    /// 私网 IPv4 内部必须让普通物理网卡排在虚拟/VPN/容器网卡之前；这正是
+    /// 「默认选中 WSL 地址」的回归点。名称匹配大小写不敏感，且不能把
+    /// 「Ethernet」误判成「vEthernet」。
+    #[test]
+    fn physical_private_ipv4_precedes_virtual_adapters() {
+        let mut addresses = [
+            listen("172.17.0.1", "vEthernet (WSL)"),
+            listen("192.168.1.20", "Ethernet"),
+            listen("10.8.0.2", "Tailscale"),
+            listen("192.168.1.21", "WLAN"),
+            listen("172.20.10.1", "Docker Bridge"),
+            listen("192.168.1.22", "Hyper-V Virtual Ethernet Adapter"),
+        ];
+        addresses.sort_by_key(order_key);
+        let order = addresses
+            .iter()
+            .map(|address| address.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            vec![
+                "Ethernet",
+                "WLAN",
+                "vEthernet (WSL)",
+                "Tailscale",
+                "Docker Bridge",
+                "Hyper-V Virtual Ethernet Adapter",
+            ]
+        );
+        assert!(!is_virtual_interface("Ethernet"));
+        assert!(!is_virtual_interface("以太网"));
+        assert!(is_virtual_interface("VETHERNET"));
+    }
+
+    /// 排序后的第一项非回环 IPv4 必须来自物理网卡，即使虚拟网卡在系统枚举中更早出现。
+    #[test]
+    fn advertised_ipv4_prefers_physical_adapter_after_ordering() {
+        let mut addresses = vec![
+            listen("172.17.0.1", "vEthernet (WSL)"),
+            listen("192.168.1.20", "Ethernet"),
+        ];
+        addresses.sort_by_key(order_key);
+        assert_eq!(advertised_ipv4(&addresses), Ipv4Addr::new(192, 168, 1, 20));
     }
 }

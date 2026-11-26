@@ -24,6 +24,10 @@ fn snapshot(phase: Phase, uploaded: u64, downloaded: u64) -> Snapshot {
         address_options: Vec::new(),
         status: String::new(),
         error: None,
+        wildcard: false,
+        single_address: true,
+        active_ip: String::new(),
+        active_ip_options: Vec::new(),
         uploaded,
         downloaded,
         started_at: None,
@@ -146,46 +150,17 @@ fn shared_path_strips_verbatim_prefix_for_display_only() {
     assert_eq!(data(&plain, false)["shared_path"], "C:/share/folder");
 }
 
-/// 范围提示必须来自实际绑定地址：回环只说「仅本机」，不能写成手机可访问；
-/// 局域网地址才提示同一网络。地址缺失时保持空串，避免显示错误范围。
+/// 通配网络信息只在运行态出现：空闲时即使选中输入仍是 `0.0.0.0`，
+/// `wildcard` 也必须为 false，避免非运行态泄露端口/密钥或让单地址行误显示。
 #[test]
-fn scope_follows_bound_address() {
-    use kerminal_plugin_lan_transfer::l10n::{Key, Locale};
-
-    let locale = Locale::detect();
-    let mut loopback = snapshot(Phase::Running, 0, 0);
-    loopback.address = Some("127.0.0.1:43210".into());
-    assert_eq!(
-        data(&loopback, false)["scope"],
-        locale.text(Key::ScopeLocalOnly)
-    );
-
-    let mut lan = snapshot(Phase::Running, 0, 0);
-    lan.address = Some("192.168.1.10:43210".into());
-    assert_eq!(data(&lan, false)["scope"], locale.text(Key::ScopeLan));
-
-    assert_eq!(data(&snapshot(Phase::Running, 0, 0), false)["scope"], "");
-}
-
-/// 编辑区只保留一句短提示：新宿主用下拉列出地址，旧宿主忽略扩展后仍能
-/// 从提示得知可输入 `0.0.0.0`；不能再把地址拼成逗号列表与下拉重复。
-#[test]
-fn address_hint_is_short_and_mentions_wildcard() {
-    let mut snapshot = snapshot(Phase::Idle, 0, 0);
-    snapshot.addresses = vec!["127.0.0.1".into(), "192.168.1.10".into()];
-    let hint = data(&snapshot, false)["addresses_hint"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert!(hint.contains("0.0.0.0"), "{hint}");
-    assert!(
-        !hint.contains(','),
-        "hint must not repeat an address list: {hint}"
-    );
-    assert!(
-        !hint.contains('\n'),
-        "hint must stay one short line: {hint}"
-    );
+fn wildcard_network_fields_are_running_only() {
+    let mut idle = snapshot(Phase::Idle, 0, 0);
+    idle.selected_address = "0.0.0.0".into();
+    let value = data(&idle, false);
+    assert_eq!(value["wildcard"], false);
+    assert_eq!(value["single_address"], true);
+    assert_eq!(value["active_ip"], "");
+    assert!(value["active_ip_options"].as_array().unwrap().is_empty());
 }
 
 /// 下拉需要分别保留显示标签和地址值，确保界面足以区分每种范围且动作能提交实际地址。
@@ -225,32 +200,48 @@ fn address_options_expose_loopback_and_wildcard() {
     );
 }
 
-/// 通配监听运行时范围必须写成「所有网络接口」，并说明链接实际使用的具体
-/// IPv4 与 VPN/虚拟网卡、防火墙边界；具体地址模式不显示这条说明，避免占位。
+/// 通配运行必须暴露当前 IP、带端口的选项与单地址布尔量；单地址运行不暴露
+/// 可切换集合，视图据此渲染等宽地址文本而不是下拉。
 #[test]
-fn wildcard_running_discloses_scope_and_concrete_link_address() {
-    use kerminal_plugin_lan_transfer::l10n::{Key, Locale};
-
+fn wildcard_running_exposes_switchable_active_ip() {
     let mut wildcard = snapshot(Phase::Running, 0, 0);
     wildcard.selected_address = "0.0.0.0".into();
     wildcard.address = Some("192.168.1.10:43210".into());
     wildcard.link = Some("http://192.168.1.10:43210/#secret".into());
+    wildcard.wildcard = true;
+    wildcard.single_address = false;
+    wildcard.active_ip = "192.168.1.10".into();
+    wildcard.active_ip_options = vec![
+        AddressOption {
+            label: "192.168.1.10:43210 · Ethernet".into(),
+            value: "192.168.1.10".into(),
+        },
+        AddressOption {
+            label: "127.0.0.1:43210 · 仅本机".into(),
+            value: "127.0.0.1".into(),
+        },
+    ];
     let value = data(&wildcard, true);
     assert_eq!(value["wildcard"], true);
-    assert_eq!(
-        value["scope"],
-        Locale::detect().text(Key::ScopeAllInterfaces)
+    assert_eq!(value["single_address"], false);
+    assert_eq!(value["active_ip"], "192.168.1.10");
+    let options = value["active_ip_options"].as_array().unwrap();
+    assert_eq!(options.len(), 2);
+    assert!(
+        options
+            .iter()
+            .all(|option| option["label"].as_str().unwrap().contains(":43210"))
     );
-    let note = value["address_note"].as_str().unwrap();
-    assert!(note.contains("192.168.1.10:43210"), "{note}");
-    assert!(!note.contains("0.0.0.0:43210"), "{note}");
 
     let mut single = snapshot(Phase::Running, 0, 0);
     single.address = Some("192.168.1.10:43210".into());
+    single.wildcard = false;
+    single.single_address = true;
     let value = data(&single, false);
     assert_eq!(value["wildcard"], false);
-    assert_eq!(value["address_note"], "");
-    assert_eq!(value["scope"], Locale::detect().text(Key::ScopeLan));
+    assert_eq!(value["single_address"], true);
+    assert_eq!(value["active_ip"], "");
+    assert!(value["active_ip_options"].as_array().unwrap().is_empty());
 }
 
 /// 面板外观契约：根滚动声明 inset，标题/操作行声明 header，分组区声明 grouped。
@@ -273,48 +264,26 @@ fn panel_declares_opt_in_appearance() {
         .find(|node| node["x-kerminal-appearance"] == "header")
         .expect("header row");
     assert_eq!(header["type"], "row");
-    assert_eq!(
-        header["children"][0]["children"][0]["x-kerminal-appearance"],
-        "title"
-    );
-    // 状态是低优先级的语义文本，用 caption 与标题区分层级。
-    assert_eq!(
-        header["children"][0]["children"][1]["x-kerminal-appearance"],
-        "caption"
-    );
-    let notice = children
-        .iter()
-        .find(|node| node["type"] == "notice")
-        .expect("trusted-network notice");
-    assert_eq!(notice["x-kerminal-appearance"], "caption");
-    // 可操作的具体原因必须排在通用安全提醒之前：用户先看到该改什么，
-    // 而不是先读一段与本次失败无关的说明。
+    // 标题直接是 Header 的第一个可见子项；下面不再有「未启动/运行中」副标题。
+    assert_eq!(header["children"][0]["x-kerminal-appearance"], "title");
+    assert!(!text.contains("\"$status\""));
+    assert!(!text.contains("\"type\": \"badge\""));
+    // 常驻提示已移除，只保留真实错误行。
+    assert!(!text.contains("\"type\": \"notice\""));
+    assert!(!text.contains("%notice.plaintext%"));
     let error_index = children
         .iter()
         .position(|node| node["text"] == "$error")
         .expect("actionable error row");
-    let notice_index = children
-        .iter()
-        .position(|node| node["type"] == "notice")
-        .unwrap();
-    assert!(error_index < notice_index, "error must precede notice");
-    // 运行区标题已经是目录名，下面不能再重复一个「目录」标签；
-    // 同时范围提示必须绑定实际绑定地址（$scope），不能写成固定的局域网文案。
+    assert_eq!(children[error_index]["tone"], "danger");
+    assert_eq!(children[error_index]["visible"], "$show_error");
+    // 运行卡片是无标题的圆角分组，内部按「目录 / 访问地址 / 二维码 / 计数」排列。
     let running_section = children
         .iter()
-        .find(|node| node["title"] == "$root_name")
+        .find(|node| node["type"] == "section" && node["visible"] == "$running")
         .expect("running section");
+    assert_eq!(running_section["title"], "");
     let running_children = running_section["children"].as_array().unwrap();
-    assert!(
-        !running_children
-            .iter()
-            .any(|node| node["text"] == "%field.folder%"),
-        "running section must not repeat the folder label"
-    );
-    assert!(
-        running_children.iter().any(|node| node["text"] == "$scope"),
-        "running section must show the bound scope"
-    );
     // 启动/停止是兄弟节点，各自用阶段布尔量控制可见性；两者不会同时显示忙碌态。
     let actions = header["children"]
         .as_array()
@@ -341,19 +310,75 @@ fn panel_declares_opt_in_appearance() {
     assert!(text.contains("\"bind\": \"selected_address\""));
     assert!(text.contains("\"on_submit\": \"set-address\""));
     assert!(text.contains("\"x-kerminal-select-options\": \"$address_options\""));
-    // 通配运行的额外说明由数据里的 wildcard/address_note 控制，不能改成固定文案。
-    assert!(text.contains("\"text\": \"$address_note\""));
-    assert!(text.contains("\"visible\": \"$wildcard\""));
+    // 运行区两个分组块：目录（标签 + 完整路径）与访问地址（标签 + 可变行/固定行）。
+    let folder_block = running_children
+        .iter()
+        .find(|node| node["type"] == "stack" && node["children"][0]["text"] == "%field.folder%")
+        .expect("folder block");
+    assert_eq!(
+        folder_block["children"][0]["x-kerminal-appearance"],
+        "caption"
+    );
+    assert_eq!(folder_block["children"][1]["text"], "$shared_path");
+    assert_eq!(
+        folder_block["children"][1]["x-kerminal-appearance"],
+        "value"
+    );
+    let address_block = running_children
+        .iter()
+        .find(|node| node["type"] == "stack" && node["children"][0]["text"] == "%field.address%")
+        .expect("address block");
+    let wildcard_row = address_block["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["visible"] == "$wildcard")
+        .expect("wildcard row");
+    assert_eq!(wildcard_row["x-kerminal-appearance"], "stretch-first");
+    let active_input = &wildcard_row["children"][0];
+    assert_eq!(active_input["bind"], "active_ip");
+    // 行内输入不能再带 label：上方标签已经说明含义，重复 label 会让下拉与按钮错位。
+    assert!(
+        active_input.get("label").is_none(),
+        "wildcard row input must not repeat a label"
+    );
+    assert_eq!(
+        active_input["x-kerminal-select-options"],
+        "$active_ip_options"
+    );
+    assert_eq!(active_input["x-kerminal-on-change"], "select-active-ip");
+    assert_eq!(active_input["on_submit"], "select-active-ip");
+    assert_eq!(wildcard_row["children"][1]["action"], "copy-link");
+    let single_row = address_block["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["visible"] == "$single_address")
+        .expect("single row");
+    assert_eq!(single_row["x-kerminal-appearance"], "stretch-first");
+    assert_eq!(single_row["children"][0]["x-kerminal-appearance"], "mono");
+    assert_eq!(single_row["children"][0]["text"], "$address");
+    assert_eq!(single_row["children"][1]["action"], "copy-link");
+    assert!(
+        running_children
+            .iter()
+            .any(|node| node["type"] == "qrcode" && node["matrix"] == "$qr")
+    );
+    assert!(
+        running_children
+            .iter()
+            .any(|node| node["text"] == "$stats" && node["tone"] == "muted")
+    );
     // 复制结果只改按钮文案，不能再插入一条会推动二维码的独立提示行。
     assert!(text.contains("\"label\": \"$copy_label\""));
     assert!(!text.contains("\"$copy_status\""));
     assert!(!text.contains("\"$copied\""));
+    // 旧的长说明、范围行与编辑区提示都已移除，不留下无绑定的死节点。
+    assert!(!text.contains("$address_note"));
+    assert!(!text.contains("$scope"));
+    assert!(!text.contains("$addresses_hint"));
+    assert!(!text.contains("%section.share%"));
     // 运行中的路径必须读取只读运行时字段，不能绑定到可被宿主草稿保护的 root_path。
-    assert!(
-        running_children
-            .iter()
-            .any(|node| node["text"] == "$shared_path")
-    );
     assert!(
         running_children
             .iter()
@@ -381,13 +406,11 @@ fn idle_snapshot_has_no_secrets() {
     assert!(value["qr"].is_null());
     assert!(value["address"].is_null());
     assert_eq!(value["selected_address"], "192.168.1.10");
-    // 只给出回环时必须直接说明「仅本机可访问」，不能只列一个地址让用户误以为可用。
-    assert!(
-        value["addresses_hint"]
-            .as_str()
-            .is_some_and(|hint| !hint.is_empty()),
-        "address hint must never be empty"
-    );
+    // 运行期网络字段不得在空闲态泄露：视图据此只显示编辑卡片。
+    assert_eq!(value["wildcard"], false);
+    assert_eq!(value["single_address"], true);
+    assert_eq!(value["active_ip"], "");
+    assert!(value["active_ip_options"].as_array().unwrap().is_empty());
 }
 
 /// 面板视图与数据契约必须自洽：每个 `$binding` 都能在默认数据里找到同名字段，
