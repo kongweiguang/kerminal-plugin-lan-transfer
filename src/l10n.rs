@@ -52,6 +52,8 @@ pub enum Key {
     AddressOptionLoopback,
     AddressOptionAllInterfaces,
     ActiveIpLoopback,
+    GroupLan,
+    GroupLocal,
     ErrorRootMissing,
     ErrorRootNotDirectory,
     ErrorRootRejected,
@@ -87,6 +89,8 @@ impl Key {
             }
             // 通配运行期的回环选项：明确「仅本机」，避免用户把二维码发给外部设备。
             Self::ActiveIpLoopback => ("仅本机", "This device only"),
+            Self::GroupLan => ("局域网", "LAN"),
+            Self::GroupLocal => ("本机", "Local"),
             Self::ErrorRootMissing => ("请选择共享目录", "Choose a shared folder"),
             Self::ErrorRootNotDirectory => ("所选路径不是目录", "Selected path is not a folder"),
             Self::ErrorRootRejected => (
@@ -139,6 +143,8 @@ mod tests {
             Key::AddressOptionLoopback,
             Key::AddressOptionAllInterfaces,
             Key::ActiveIpLoopback,
+            Key::GroupLan,
+            Key::GroupLocal,
             Key::ErrorRootMissing,
             Key::ErrorRootNotDirectory,
             Key::ErrorRootRejected,

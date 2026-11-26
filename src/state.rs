@@ -41,6 +41,18 @@ pub struct AddressOption {
     pub value: String,
 }
 
+/// 运行态平铺地址列表中的一行。
+///
+/// `ip` 是行唯一键，用于行点击切换二维码与行尾复制动作；`address` 用于等宽展示，
+/// `group` 承载「局域网 / 本机」分组标签，`hint` 保留网卡名作为悬停提示。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AddressItem {
+    pub ip: String,
+    pub address: String,
+    pub group: String,
+    pub hint: String,
+}
+
 /// 通配监听本次启动冻结的运行时信息。
 ///
 /// 只保存在内存里：端口、配对密钥与 Host 白名单都以启动那一刻为准，切换展示
@@ -56,6 +68,8 @@ pub struct WildcardRuntime {
     pub active_ip: Ipv4Addr,
     /// 与 `allowed` 一一对应的下拉选项，标签里带端口。
     pub options: Vec<AddressOption>,
+    /// 与 `allowed` 一一对应的平铺地址行（局域网在前、本机在后），用于运行态直接展示并逐行复制。
+    pub items: Vec<AddressItem>,
     /// 与 `HostPolicy::wildcard` 同源的 IPv4 白名单。
     pub allowed: Vec<Ipv4Addr>,
 }
@@ -91,6 +105,8 @@ pub struct Snapshot {
     pub active_ip: String,
     /// 通配运行期的地址下拉；其他阶段为空。
     pub active_ip_options: Vec<AddressOption>,
+    /// 运行期的平铺地址列表（单网卡 1 行，全网卡列出全部白名单 IPv4）；非运行态为空。
+    pub address_items: Vec<AddressItem>,
     pub uploaded: u64,
     pub downloaded: u64,
     pub started_at: Option<u64>,
@@ -191,6 +207,18 @@ impl State {
             active_ip_options: if wildcard {
                 runtime
                     .map(|runtime| runtime.options.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            },
+            address_items: if wildcard {
+                runtime
+                    .map(|runtime| runtime.items.clone())
+                    .unwrap_or_default()
+            } else if inner.phase == Phase::Running {
+                inner
+                    .address
+                    .map(|bound| vec![single_address_item(&inner.addresses, bound)])
                     .unwrap_or_default()
             } else {
                 Vec::new()
@@ -635,6 +663,77 @@ pub fn active_ip_options(
         .collect()
 }
 
+/// 生成通配运行期的平铺地址行：局域网地址在前（物理网卡优先），本机回环在后。
+///
+/// 与 `active_ip_options` 共享同一份启动冻结白名单；每行自带 `group`（局域网 / 本机）
+/// 与 `hint`（网卡名），面板可按参考样式平铺展示并支持逐行单点复制。
+///
+/// @author kongweiguang
+pub fn active_ip_items(
+    addresses: &[ListenAddress],
+    allowed: &[Ipv4Addr],
+    port: u16,
+) -> Vec<AddressItem> {
+    let locale = Locale::detect();
+    allowed
+        .iter()
+        .map(|ip| {
+            let group = if ip.is_loopback() {
+                locale.text(Key::GroupLocal)
+            } else {
+                locale.text(Key::GroupLan)
+            }
+            .to_owned();
+            let hint = if ip.is_loopback() {
+                locale.text(Key::ActiveIpLoopback).to_owned()
+            } else {
+                addresses
+                    .iter()
+                    .find(|address| address.ip == IpAddr::V4(*ip))
+                    .map(|address| address.label.clone())
+                    .filter(|label| !label.is_empty() && label != "loopback")
+                    .unwrap_or_default()
+            };
+            AddressItem {
+                ip: ip.to_string(),
+                address: format!("{ip}:{port}"),
+                group,
+                hint,
+            }
+        })
+        .collect()
+}
+
+/// 生成单地址运行期的平铺地址行，使单网卡与全网卡共用同一套列表呈现与复制交互。
+///
+/// @author kongweiguang
+fn single_address_item(addresses: &[ListenAddress], bound: SocketAddr) -> AddressItem {
+    let locale = Locale::detect();
+    let loopback = bound.ip().is_loopback();
+    let group = if loopback {
+        locale.text(Key::GroupLocal)
+    } else {
+        locale.text(Key::GroupLan)
+    }
+    .to_owned();
+    let hint = if loopback {
+        locale.text(Key::ActiveIpLoopback).to_owned()
+    } else {
+        addresses
+            .iter()
+            .find(|address| address.ip == bound.ip())
+            .map(|address| address.label.clone())
+            .filter(|label| !label.is_empty() && label != "loopback")
+            .unwrap_or_default()
+    };
+    AddressItem {
+        ip: bound.ip().to_string(),
+        address: bound.to_string(),
+        group,
+        hint,
+    }
+}
+
 /// 状态行文案；与 `l10n::Key` 保持同一套措辞。
 fn status_text(phase: Phase) -> &'static str {
     let locale = crate::l10n::Locale::detect();
@@ -923,6 +1022,20 @@ mod tests {
                 AddressOption {
                     label: "127.0.0.1:65395 · 仅本机".into(),
                     value: "127.0.0.1".into(),
+                },
+            ],
+            items: vec![
+                AddressItem {
+                    ip: "192.168.1.10".into(),
+                    address: "192.168.1.10:65395".into(),
+                    group: "局域网".into(),
+                    hint: "Ethernet".into(),
+                },
+                AddressItem {
+                    ip: "127.0.0.1".into(),
+                    address: "127.0.0.1:65395".into(),
+                    group: "本机".into(),
+                    hint: "仅本机".into(),
                 },
             ],
             allowed: vec![Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::LOCALHOST],

@@ -17,6 +17,8 @@
     "single_address": true,
     "active_ip": "",
     "active_ip_options": [],
+    "address_items": [],
+    "copied_ip": "",
     "link": null,
     "root_name": null,
     "qr": null,
@@ -114,7 +116,7 @@
             },
             {
               "type": "stack",
-              "gap": "md",
+              "gap": "sm",
               "children": [
                 {
                   "type": "text",
@@ -123,25 +125,17 @@
                   "tone": "muted"
                 },
                 {
-                  "type": "input",
-                  "bind": "active_ip",
-                  "on_submit": "select-active-ip",
-                  "visible": "$wildcard",
-                  "x-kerminal-select-options": "$active_ip_options",
-                  "x-kerminal-on-change": "select-active-ip"
-                },
-                {
-                  "type": "text",
-                  "x-kerminal-appearance": "mono",
-                  "text": "$address",
-                  "visible": "$single_address"
-                },
-                {
-                  "type": "button",
-                  "action": "copy-link",
-                  "label": "$copy_label",
-                  "icon": "copy",
-                  "variant": "secondary"
+                  "id": "running-addresses",
+                  "type": "list",
+                  "items": "$address_items",
+                  "key": "ip",
+                  "title": "address",
+                  "subtitle": "group",
+                  "on_activate": "select-active-ip",
+                  "x-kerminal-appearance": "flat-copy-list",
+                  "x-kerminal-row-action": "copy-link",
+                  "x-kerminal-selected-binding": "$active_ip",
+                  "x-kerminal-copied-binding": "$copied_ip"
                 }
               ]
             },

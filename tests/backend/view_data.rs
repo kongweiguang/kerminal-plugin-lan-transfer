@@ -28,6 +28,7 @@ fn snapshot(phase: Phase, uploaded: u64, downloaded: u64) -> Snapshot {
         single_address: true,
         active_ip: String::new(),
         active_ip_options: Vec::new(),
+        address_items: Vec::new(),
         uploaded,
         downloaded,
         started_at: None,
@@ -303,14 +304,14 @@ fn panel_declares_opt_in_appearance() {
             .count(),
         2
     );
-    // 一次性配对密钥不能作为普通文本出现；复制必须走按钮动作。
+    // 一次性配对密钥不能作为普通文本出现；复制必须走平铺行动作。
     assert!(!text.contains("\"$link\""));
-    assert!(text.contains("\"action\": \"copy-link\""));
+    assert!(text.contains("\"x-kerminal-row-action\": \"copy-link\""));
     // 地址输入保持原绑定与 Enter 提交，同时用扩展声明下拉选项；旧宿主忽略扩展。
     assert!(text.contains("\"bind\": \"selected_address\""));
     assert!(text.contains("\"on_submit\": \"set-address\""));
     assert!(text.contains("\"x-kerminal-select-options\": \"$address_options\""));
-    // 运行区两个分组块：目录（标签 + 完整路径）与访问地址（标签 + 可变行/固定行）。
+    // 运行区两个分组块：目录（标签 + 完整路径）与访问地址（标签 + 平铺逐行复制列表）。
     let folder_block = running_children
         .iter()
         .find(|node| node["type"] == "stack" && node["children"][0]["text"] == "%field.folder%")
@@ -328,35 +329,17 @@ fn panel_declares_opt_in_appearance() {
         .iter()
         .find(|node| node["type"] == "stack" && node["children"][0]["text"] == "%field.address%")
         .expect("address block");
-    let address_children = address_block["children"].as_array().unwrap();
-    let active_input = address_children
-        .iter()
-        .find(|node| node["visible"] == "$wildcard")
-        .expect("wildcard active_ip select");
-    assert_eq!(active_input["type"], "input");
-    assert_eq!(active_input["bind"], "active_ip");
-    // 地址块上方已有标签，下拉不再重复 label，并占满卡片宽度避免截断端口与网卡名。
-    assert!(
-        active_input.get("label").is_none(),
-        "wildcard active_ip input must not repeat a label"
-    );
-    assert_eq!(
-        active_input["x-kerminal-select-options"],
-        "$active_ip_options"
-    );
-    assert_eq!(active_input["x-kerminal-on-change"], "select-active-ip");
-    assert_eq!(active_input["on_submit"], "select-active-ip");
-    let single_text = address_children
-        .iter()
-        .find(|node| node["visible"] == "$single_address")
-        .expect("single address text");
-    assert_eq!(single_text["x-kerminal-appearance"], "mono");
-    assert_eq!(single_text["text"], "$address");
-    assert!(
-        address_children
-            .iter()
-            .any(|node| node["action"] == "copy-link")
-    );
+    let address_list = &address_block["children"][1];
+    assert_eq!(address_list["type"], "list");
+    assert_eq!(address_list["items"], "$address_items");
+    assert_eq!(address_list["key"], "ip");
+    assert_eq!(address_list["title"], "address");
+    assert_eq!(address_list["subtitle"], "group");
+    assert_eq!(address_list["on_activate"], "select-active-ip");
+    assert_eq!(address_list["x-kerminal-appearance"], "flat-copy-list");
+    assert_eq!(address_list["x-kerminal-row-action"], "copy-link");
+    assert_eq!(address_list["x-kerminal-selected-binding"], "$active_ip");
+    assert_eq!(address_list["x-kerminal-copied-binding"], "$copied_ip");
     assert!(
         running_children
             .iter()
@@ -367,8 +350,7 @@ fn panel_declares_opt_in_appearance() {
             .iter()
             .any(|node| node["text"] == "$stats" && node["tone"] == "muted")
     );
-    // 复制结果只改按钮文案，不能再插入一条会推动二维码的独立提示行。
-    assert!(text.contains("\"label\": \"$copy_label\""));
+    // 复制确认只通过行尾图标高亮 `$copied_ip` 表达，不再插入推动二维码的提示行。
     assert!(!text.contains("\"$copy_status\""));
     assert!(!text.contains("\"$copied\""));
     // 旧的长说明、范围行与编辑区提示都已移除，不留下无绑定的死节点。

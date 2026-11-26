@@ -484,6 +484,7 @@ impl Controller {
             let port = bound.port();
             let advertised = SocketAddr::new(IpAddr::V4(ipv4), port);
             let options = crate::state::active_ip_options(&addresses, &allowed, port);
+            let items = crate::state::active_ip_items(&addresses, &allowed, port);
             (
                 advertised,
                 crate::http::HostPolicy::wildcard(port, allowed.clone()),
@@ -492,6 +493,7 @@ impl Controller {
                     secret: secret.clone(),
                     active_ip: ipv4,
                     options,
+                    items,
                     allowed,
                 }),
             )

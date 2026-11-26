@@ -1142,7 +1142,7 @@ class SidecarEndToEnd(unittest.TestCase):
         self.assertEqual(len(inline), 1, "未运行业务失败必须通知调用窗口一次")
         self.assertIn(reply["error"]["message"], inline)
         patches = self._notification_patches(self.rpc, notifications)
-        self.assertEqual(set(patches[0].keys()), {"error", "show_error", "copy_label"})
+        self.assertEqual(set(patches[0].keys()), {"error", "show_error", "copy_label", "copied_ip"})
         self.assertEqual(
             patches[0]["copy_label"],
             default_label,
@@ -1220,9 +1220,9 @@ class SidecarEndToEnd(unittest.TestCase):
             "copy-link",
         )
         patch = result["patch"]
-        # 复制成功回执只包含调用窗口的按钮文案；link/qr 等全量状态字段不能
+        # 复制成功回执只包含调用窗口的复制状态字段；link/qr 等全量状态字段不能
         # 借这次剪贴板动作写回宿主，否则会反写另一窗口刚提交的生命周期结果。
-        self.assertEqual(set(patch.keys()), {"copy_label"}, "复制回执必须只含按钮文案")
+        self.assertEqual(set(patch.keys()), {"copy_label", "copied_ip"}, "复制回执必须只含复制确认字段")
         self.assertTrue(patch["copy_label"], "复制确认文案不能为空")
         self.assertNotEqual(patch["copy_label"], default_label, "ACK 后应切换按钮文案")
         self.assertEqual(self.rpc.clipboard_requests, requests_before + 1)

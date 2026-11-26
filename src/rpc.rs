@@ -160,6 +160,11 @@ impl ViewRegistry {
             .ok_or_else(|| Error::new(-32602, "missing action"))?;
         // 局部变量不能与下方 `data()` 同名，否则 `data(&snapshot)` 会被解析成值调用。
         let payload = params.get("data").cloned().unwrap_or(Value::Null);
+        let item_key = params
+            .get("item_key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
         // 发起动作的实例由动作回执更新；广播时排除它，避免同一补丁被应用两次。
         // 但动作失败时宿主不会提交任何补丁（协议错误没有 data），因此调用方仍需
         // 单独收到状态补丁，否则它的窗口会停在动作前的旧状态。例如停止失败后状态
@@ -172,7 +177,7 @@ impl ViewRegistry {
         // 避免迟到的全量回执覆盖其他窗口已经提交的生命周期状态。
         if action == "copy-link" {
             return self
-                .copy_link(context, caller.as_deref(), &payload, cancel)
+                .copy_link(context, caller.as_deref(), item_key, &payload, cancel)
                 .await;
         }
         // 动作前的投影用于判断失败是否真的改变了可见状态；只有变化时才推送给
@@ -184,7 +189,7 @@ impl ViewRegistry {
         // 记下最近一次动作的上下文：统计推送任务只在 HTTP 完成时被唤醒，
         // 那时没有活跃请求可用，只能复用这个句柄。
         *self.context.lock().await = Some(context.clone());
-        let outcome = self.dispatch(action, &payload).await;
+        let outcome = self.dispatch(action, item_key, &payload).await;
         let snapshot = self.snapshot()?;
         let mut patch = data(&snapshot, self.controller.retains_running_resources());
         let changed = patch != before;
@@ -247,6 +252,7 @@ impl ViewRegistry {
         &self,
         context: &Context,
         caller: Option<&str>,
+        item_key: Option<&str>,
         payload: &Value,
         cancel: CancellationToken,
     ) -> Result<Value> {
@@ -261,11 +267,10 @@ impl ViewRegistry {
                 .await;
         }
 
-        // 旧宿主兜底：动作数据里带了不同的白名单 IP 就先切换。切换失败说明
-        // 选项已过期或不在本次冻结白名单内，不能继续复制一个界面正在显示的
-        // 未生效地址。
+        // 平铺列表逐行复制时由 `item_key` 直接指定目标 IP；旧宿主下拉兜底仍读 `payload.active_ip`。
+        let requested = item_key.or_else(|| requested_active_ip(payload));
         let switched = if before.wildcard {
-            match requested_active_ip(payload) {
+            match requested {
                 Some(requested) if requested != before.active_ip => {
                     if let Err(error) = self.controller.state.select_active_ip(requested) {
                         let failure = select_ip_failure(&error);
@@ -277,12 +282,25 @@ impl ViewRegistry {
                 }
                 _ => None,
             }
+        } else if let Some(requested) = item_key {
+            let bound_ip = before
+                .address
+                .as_deref()
+                .and_then(|value| value.parse::<std::net::SocketAddr>().ok())
+                .map(|addr| addr.ip().to_string());
+            if bound_ip.as_deref() != Some(requested) {
+                let failure = ActionFailure::validation(Key::ErrorAddressInvalid);
+                self.notify_caller(context, caller, failure_patch(&failure))
+                    .await;
+                return Err(failure.error);
+            }
+            None
         } else {
             None
         };
 
         // 切换已经真实发生，必须让其他窗口同步新链接与二维码；复制确认本身
-        // 仍只属于调用窗口，因此广播补丁里不含 `copy_label`。
+        // 仍只属于调用窗口，因此广播补丁里不含 `copy_label` 与 `copied_ip`。
         if let Some(snapshot) = &switched {
             self.broadcast(context, caller, share_patch(snapshot)).await;
         }
@@ -317,6 +335,16 @@ impl ViewRegistry {
             && before.started_at == after.started_at
             && before.expires_at == after.expires_at
         {
+            let copied_ip = if !current.active_ip.is_empty() {
+                current.active_ip.clone()
+            } else {
+                current
+                    .address
+                    .as_deref()
+                    .and_then(|value| value.parse::<std::net::SocketAddr>().ok())
+                    .map(|addr| addr.ip().to_string())
+                    .unwrap_or_default()
+            };
             let mut patch = switched
                 .as_ref()
                 .map(share_patch)
@@ -326,6 +354,7 @@ impl ViewRegistry {
                     "copy_label".into(),
                     Value::String(Locale::detect().text(Key::CopyDone).to_owned()),
                 );
+                object.insert("copied_ip".into(), Value::String(copied_ip));
             }
             return Ok(json!({ "patch": patch }));
         }
@@ -368,6 +397,7 @@ impl ViewRegistry {
     async fn dispatch(
         &self,
         action: &str,
+        item_key: Option<&str>,
         payload: &Value,
     ) -> std::result::Result<(), ActionFailure> {
         match action {
@@ -441,9 +471,11 @@ impl ViewRegistry {
                     .map_err(ActionFailure::app)?;
             }
             // 通配运行期切换展示 IP：只改链接/二维码与选中值，绝不重启监听。
-            // 未运行与单地址模式都拒绝，避免界面出现一个无法解释的“切换成功”。
+            // 既支持平铺列表行点击传入 `item_key`，也兼容旧下拉传入 `data.active_ip`。
             "select-active-ip" => {
-                let Some(value) = payload.get("active_ip").and_then(Value::as_str) else {
+                let Some(value) =
+                    item_key.or_else(|| payload.get("active_ip").and_then(Value::as_str))
+                else {
                     return Err(ActionFailure::protocol(Error::new(
                         -32602,
                         "missing active_ip",
@@ -457,6 +489,15 @@ impl ViewRegistry {
                     ));
                 }
                 if !snapshot.wildcard {
+                    // 单网卡平铺行点击当前唯一地址是无害幂等操作；其他地址仍拒绝。
+                    let bound_ip = snapshot
+                        .address
+                        .as_deref()
+                        .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
+                        .map(|addr| addr.ip().to_string());
+                    if item_key.is_some() && bound_ip.as_deref() == Some(value.trim()) {
+                        return Ok(());
+                    }
                     return Err(ActionFailure::validation(Key::ErrorAddressInvalid));
                 }
                 self.controller
@@ -641,6 +682,7 @@ fn failure_patch(failure: &ActionFailure) -> Value {
         "error": failure.error.message,
         "show_error": true,
         "copy_label": Locale::detect().text(Key::CopyAction),
+        "copied_ip": "",
     })
 }
 
@@ -654,19 +696,23 @@ fn share_patch(snapshot: &Snapshot) -> Value {
         "single_address": snapshot.single_address,
         "active_ip": snapshot.active_ip,
         "active_ip_options": snapshot.active_ip_options,
+        "address_items": snapshot.address_items,
+        "copied_ip": "",
+        "address_items": snapshot.address_items,
         "address": snapshot.address,
         "link": snapshot.link,
         "qr": snapshot.qr,
     })
 }
 
-/// 去掉只属于单个实例的复制按钮文案。
+/// 去掉只属于单个实例的复制按钮文案与行内已复制高亮。
 ///
 /// 非生命周期的跨窗口广播不能重置各窗口自己的「已复制」；统计推送更是只发
-/// `stats`，不会携带这个字段。只有启动、停止或失败状态更新才应恢复默认文案。
+/// `stats`，不会携带这两个字段。只有启动、停止或失败状态更新才应恢复默认状态。
 fn omit_copy_label(patch: &mut Value) {
     if let Some(object) = patch.as_object_mut() {
         object.remove("copy_label");
+        object.remove("copied_ip");
     }
 }
 
@@ -728,6 +774,8 @@ pub fn data(snapshot: &Snapshot, retains_running_resources: bool) -> Value {
         "single_address": snapshot.single_address,
         "active_ip": snapshot.active_ip,
         "active_ip_options": snapshot.active_ip_options,
+        "address_items": snapshot.address_items,
+        "copied_ip": "",
         // `link` 含一次性配对密钥，仅供剪贴板动作和集成测试读取；面板不把它
         // 当作普通文本展示，避免密钥被截图或旁人看到。
         "link": snapshot.link,
@@ -860,6 +908,7 @@ mod tests {
             single_address: true,
             active_ip: String::new(),
             active_ip_options: Vec::new(),
+            address_items: Vec::new(),
             uploaded: 0,
             downloaded: 0,
             started_at: None,
