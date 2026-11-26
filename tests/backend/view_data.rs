@@ -328,19 +328,17 @@ fn panel_declares_opt_in_appearance() {
         .iter()
         .find(|node| node["type"] == "stack" && node["children"][0]["text"] == "%field.address%")
         .expect("address block");
-    let wildcard_row = address_block["children"]
-        .as_array()
-        .unwrap()
+    let address_children = address_block["children"].as_array().unwrap();
+    let active_input = address_children
         .iter()
         .find(|node| node["visible"] == "$wildcard")
-        .expect("wildcard row");
-    assert_eq!(wildcard_row["x-kerminal-appearance"], "stretch-first");
-    let active_input = &wildcard_row["children"][0];
+        .expect("wildcard active_ip select");
+    assert_eq!(active_input["type"], "input");
     assert_eq!(active_input["bind"], "active_ip");
-    // 行内输入不能再带 label：上方标签已经说明含义，重复 label 会让下拉与按钮错位。
+    // 地址块上方已有标签，下拉不再重复 label，并占满卡片宽度避免截断端口与网卡名。
     assert!(
         active_input.get("label").is_none(),
-        "wildcard row input must not repeat a label"
+        "wildcard active_ip input must not repeat a label"
     );
     assert_eq!(
         active_input["x-kerminal-select-options"],
@@ -348,17 +346,17 @@ fn panel_declares_opt_in_appearance() {
     );
     assert_eq!(active_input["x-kerminal-on-change"], "select-active-ip");
     assert_eq!(active_input["on_submit"], "select-active-ip");
-    assert_eq!(wildcard_row["children"][1]["action"], "copy-link");
-    let single_row = address_block["children"]
-        .as_array()
-        .unwrap()
+    let single_text = address_children
         .iter()
         .find(|node| node["visible"] == "$single_address")
-        .expect("single row");
-    assert_eq!(single_row["x-kerminal-appearance"], "stretch-first");
-    assert_eq!(single_row["children"][0]["x-kerminal-appearance"], "mono");
-    assert_eq!(single_row["children"][0]["text"], "$address");
-    assert_eq!(single_row["children"][1]["action"], "copy-link");
+        .expect("single address text");
+    assert_eq!(single_text["x-kerminal-appearance"], "mono");
+    assert_eq!(single_text["text"], "$address");
+    assert!(
+        address_children
+            .iter()
+            .any(|node| node["action"] == "copy-link")
+    );
     assert!(
         running_children
             .iter()

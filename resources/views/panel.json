@@ -32,7 +32,7 @@
     "x-kerminal-action-error": "$error",
     "child": {
       "type": "stack",
-      "gap": "md",
+      "gap": "lg",
       "children": [
         {
           "type": "row",
@@ -59,7 +59,7 @@
               "action": "stop",
               "label": "%action.stop%",
               "icon": "circle-stop",
-              "variant": "ghost",
+              "variant": "secondary",
               "busy": "$stopping",
               "visible": "$can_stop"
             }
@@ -69,7 +69,7 @@
           "type": "section",
           "title": "",
           "x-kerminal-appearance": "grouped",
-          "gap": "md",
+          "gap": "lg",
           "visible": "$editable",
           "children": [
             {
@@ -92,7 +92,7 @@
           "type": "section",
           "title": "",
           "x-kerminal-appearance": "grouped",
-          "gap": "md",
+          "gap": "lg",
           "visible": "$running",
           "children": [
             {
@@ -114,7 +114,7 @@
             },
             {
               "type": "stack",
-              "gap": "sm",
+              "gap": "md",
               "children": [
                 {
                   "type": "text",
@@ -123,46 +123,25 @@
                   "tone": "muted"
                 },
                 {
-                  "type": "row",
-                  "x-kerminal-appearance": "stretch-first",
-                  "gap": "sm",
+                  "type": "input",
+                  "bind": "active_ip",
+                  "on_submit": "select-active-ip",
                   "visible": "$wildcard",
-                  "children": [
-                    {
-                      "type": "input",
-                      "bind": "active_ip",
-                      "on_submit": "select-active-ip",
-                      "x-kerminal-select-options": "$active_ip_options",
-                      "x-kerminal-on-change": "select-active-ip"
-                    },
-                    {
-                      "type": "button",
-                      "action": "copy-link",
-                      "label": "$copy_label",
-                      "icon": "copy",
-                      "variant": "secondary"
-                    }
-                  ]
+                  "x-kerminal-select-options": "$active_ip_options",
+                  "x-kerminal-on-change": "select-active-ip"
                 },
                 {
-                  "type": "row",
-                  "x-kerminal-appearance": "stretch-first",
-                  "gap": "sm",
-                  "visible": "$single_address",
-                  "children": [
-                    {
-                      "type": "text",
-                      "x-kerminal-appearance": "mono",
-                      "text": "$address"
-                    },
-                    {
-                      "type": "button",
-                      "action": "copy-link",
-                      "label": "$copy_label",
-                      "icon": "copy",
-                      "variant": "secondary"
-                    }
-                  ]
+                  "type": "text",
+                  "x-kerminal-appearance": "mono",
+                  "text": "$address",
+                  "visible": "$single_address"
+                },
+                {
+                  "type": "button",
+                  "action": "copy-link",
+                  "label": "$copy_label",
+                  "icon": "copy",
+                  "variant": "secondary"
                 }
               ]
             },
@@ -172,7 +151,7 @@
             },
             {
               "type": "text",
-              "x-kerminal-appearance": "caption",
+              "x-kerminal-appearance": "centered-caption",
               "text": "$stats",
               "tone": "muted"
             }
