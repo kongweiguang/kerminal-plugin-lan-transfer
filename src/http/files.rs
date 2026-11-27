@@ -117,7 +117,7 @@ pub async fn list(
         .get(start + page.len())
         .map(|(entry, _)| entry.name.clone());
     json_response(ListResponse {
-        breadcrumbs: breadcrumbs(&dir),
+        breadcrumbs: breadcrumbs(context.root.display_name(), &dir),
         entries: page,
         next_cursor,
     })
@@ -131,11 +131,19 @@ fn entry_id(dir: &VirtualPath, name: &str) -> Option<String> {
     dir.join(name).ok().map(|path| path.id())
 }
 
-/// 面包屑首项必须是固定 `root`，页面据此拒绝来自其他实现的响应。
-fn breadcrumbs(dir: &VirtualPath) -> Vec<Breadcrumb> {
+/// 面包屑首项必须是固定 `root`，名称使用共享根目录自身的末级目录名（不暴露上级路径），
+/// 页面据此同时校验协议并显示用户选择的目录名。
+///
+/// @author kongweiguang
+fn breadcrumbs(root_name: &str, dir: &VirtualPath) -> Vec<Breadcrumb> {
+    let label = root_name.trim();
     let mut crumbs = vec![Breadcrumb {
         id: crate::path::ROOT_ID.to_owned(),
-        name: "/".to_owned(),
+        name: if label.is_empty() {
+            "/".to_owned()
+        } else {
+            label.to_owned()
+        },
     }];
     let mut current = VirtualPath::root();
     for segment in dir.segments() {

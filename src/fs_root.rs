@@ -84,6 +84,8 @@ pub struct ShareRoot {
     root: DirHandle,
     /// 启动时记录的根身份（卷序列号+文件索引，或 dev+ino），用于启动校验与诊断。
     identity: RootIdentity,
+    /// 仅保存共享根目录自身的末级文件夹名（如 `Downloads`），不暴露任何上级路径。
+    display_name: String,
 }
 
 impl ShareRoot {
@@ -105,6 +107,15 @@ impl ShareRoot {
                 "root is hidden or internal",
             ));
         }
+        // 只保留共享目录自身的末级名称，避免向浏览器暴露本机上级目录结构；
+        // 驱动器根等没有 file_name 的路径回退为 "/"，由前端映射为本地化标题。
+        let display_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("/")
+            .to_owned();
         let root = DirHandle::open_ambient(path).map_err(|error| {
             AppError::new(
                 crate::error::ErrorCode::PathRejected,
@@ -112,7 +123,18 @@ impl ShareRoot {
             )
         })?;
         let identity = root.identity()?;
-        Ok(Self { root, identity })
+        Ok(Self {
+            root,
+            identity,
+            display_name,
+        })
+    }
+
+    /// 供浏览器标题与面包屑首项展示的共享目录名；绝不包含父目录或绝对路径。
+    ///
+    /// @author kongweiguang
+    pub fn display_name(&self) -> &str {
+        &self.display_name
     }
 
     /// 根身份用于诊断；不参与权限判断，避免把「同一路径」当成「同一目录」。

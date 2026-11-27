@@ -159,7 +159,8 @@ const REQUIRED_IDS = [
   'link-notice', 'link-notice-text',
   'link-notice-dismiss', 'connect-view', 'connect-spinner', 'connect-title',
   'connect-body', 'connect-retry', 'browse-view', 'browse-banner', 'browse-banner-text',
-  'browse-banner-action', 'share-title', 'breadcrumbs', 'upload-btn',
+  'browse-banner-action', 'share-title', 'up-btn', 'up-btn-label', 'refresh-btn',
+  'breadcrumbs', 'upload-btn',
   'file-input', 'upload-hint', 'upload-summary', 'uploads', 'uploads-title', 'cancel-all',
   'clear-done', 'upload-list', 'list-card', 'list-head', 'list-status', 'list-count',
   'list-retry', 'entries', 'list-foot', 'load-more', 'drop-overlay'
@@ -2140,5 +2141,91 @@ test('常驻明文/信任提示与页脚已移除，真实交互提示仍保留'
   assert.match(html, /id="link-notice"/);
   assert.match(html, /id="browse-banner"/);
   assert.match(html, /id="drop-overlay"/);
+  // 卡片导航栏内置“上一级”与“刷新”入口。
+  assert.match(html, /id="up-btn"/);
+  assert.match(html, /id="refresh-btn"/);
+});
+
+test('进入子目录后可通过“上一级”按钮与 Alt+ArrowUp 返回父目录，根目录时按钮禁用', async () => {
+  const page = await enterSessionWithRoot();
+  const upBtn = page.doc.getElementById('up-btn');
+  assert.equal(upBtn.disabled, true, '位于根目录时上一级按钮必须禁用');
+
+  // 点击目录行进入子目录
+  page.doc.getElementById('entries').findAll((node) => node.className === 'entry-label is-dir')[0].click();
+  await settle();
+  const enterReq = lastListRequest(page.requests);
+  assert.match(enterReq.url, /dir=d1/);
+  enterReq.resolve(jsonResponse(200, {
+    breadcrumbs: [{ id: 'root', name: 'Downloads' }, { id: 'd1', name: 'velotype' }],
+    entries: [{ id: 'f2', name: 'README.md', kind: 'file', size: 120, modified: 1700000000 }],
+    nextCursor: null
+  }));
+  await settle();
+
+  assert.equal(page.doc.getElementById('share-title').textContent, 'Downloads');
+  assert.equal(upBtn.disabled, false, '进入子目录后上一级按钮必须可用');
+  assert.match(upBtn.getAttribute('title'), /Downloads/);
+
+  // 点击“上一级”返回根目录
+  upBtn.click();
+  await settle();
+  const upReq = lastListRequest(page.requests);
+  assert.match(upReq.url, /dir=root/);
+  upReq.resolve(jsonResponse(200, {
+    breadcrumbs: [{ id: 'root', name: 'Downloads' }],
+    entries: [{ id: 'd1', name: 'velotype', kind: 'directory', size: null, modified: null }],
+    nextCursor: null
+  }));
+  await settle();
+  assert.equal(upBtn.disabled, true, '回到根目录后上一级按钮重新禁用');
+
+  // 再次进入子目录，验证 Alt+ArrowUp 快捷键同样返回父目录
+  page.doc.getElementById('entries').findAll((node) => node.className === 'entry-label is-dir')[0].click();
+  await settle();
+  lastListRequest(page.requests).resolve(jsonResponse(200, {
+    breadcrumbs: [{ id: 'root', name: 'Downloads' }, { id: 'd1', name: 'velotype' }],
+    entries: [],
+    nextCursor: null
+  }));
+  await settle();
+
+  let prevented = false;
+  page.doc.dispatch('keydown', {
+    key: 'ArrowUp',
+    altKey: true,
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    preventDefault() { prevented = true; }
+  });
+  await settle();
+  assert.equal(prevented, true);
+  assert.match(lastListRequest(page.requests).url, /dir=root/);
+});
+
+test('服务端根名称退化为 / 时标题与面包屑绝不显示孤立斜杠，文件行不带目录点击态', async () => {
+  const page = await bootPage();
+  lastListRequest(page.requests).resolve(jsonResponse(200, {
+    breadcrumbs: [{ id: 'root', name: '/' }],
+    entries: [{ id: 'f1', name: 'notes.txt', kind: 'file', size: 42, modified: 1700000000 }],
+    nextCursor: null
+  }));
+  await settle();
+
+  assert.equal(page.doc.getElementById('share-title').textContent, '共享目录');
+  assert.deepEqual(breadcrumbLabels(page.doc), ['共享根目录']);
+  const fileLabel = page.doc.getElementById('entries')
+    .find((node) => node.className === 'entry-label is-file');
+  assert.ok(fileLabel, '文件名称应标记为 is-file 以避免误导性链接悬停样式');
+});
+
+test('点击刷新按钮重拉当前目录', async () => {
+  const page = await enterSessionWithRoot();
+  const countBefore = listRequests(page.requests).length;
+  page.doc.getElementById('refresh-btn').click();
+  await settle();
+  assert.equal(listRequests(page.requests).length, countBefore + 1);
+  assert.match(lastListRequest(page.requests).url, /\/api\/list\?dir=root/);
 });
 

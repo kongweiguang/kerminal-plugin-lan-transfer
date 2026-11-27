@@ -406,6 +406,11 @@
     disconnectHint: '结束本页与共享目录的连接；不会删除任何文件。',
     // 面包屑栏标题，让只有文件夹名的一行明确表达“当前位置”而不是输入框。
     breadcrumbLabel: '当前位置',
+    goUp: '上一级',
+    goUpHint: '返回上一级目录 (Alt+↑)',
+    goUpTo: '返回上一级：{name} (Alt+↑)',
+    refresh: '刷新',
+    refreshHint: '刷新当前目录',
     shareTitle: '共享目录',
     colName: '名称',
     colSize: '大小',
@@ -421,7 +426,7 @@
     downloadStarted: '已交给浏览器下载；是否保存以浏览器为准。',
     downloadFailed: '下载未开始',
     selectFiles: '选择文件',
-    dropHint: '也可以把文件拖到此页面',
+    dropHint: '拖放文件即可上传',
     dropHere: '松开以上传到当前目录',
     uploadsTitle: '上传',
     uploadTarget: '上传 · {path}',
@@ -501,6 +506,11 @@
     disconnect: 'Disconnect',
     disconnectHint: 'Ends this page\'s connection to the shared folder. No files are deleted.',
     breadcrumbLabel: 'Current location',
+    goUp: 'Up',
+    goUpHint: 'Go to parent folder (Alt+↑)',
+    goUpTo: 'Go up to {name} (Alt+↑)',
+    refresh: 'Refresh',
+    refreshHint: 'Refresh current folder',
     shareTitle: 'Shared folder',
     colName: 'Name',
     colSize: 'Size',
@@ -516,7 +526,7 @@
     downloadStarted: 'Handed to the browser; whether it is saved is up to the browser.',
     downloadFailed: 'Download did not start',
     selectFiles: 'Choose files',
-    dropHint: 'You can also drop files onto this page',
+    dropHint: 'Drop files anywhere to upload',
     dropHere: 'Drop to upload into the current folder',
     uploadsTitle: 'Uploads',
     uploadTarget: 'Uploads · {path}',
@@ -675,6 +685,9 @@
       browseBannerText: byId('browse-banner-text'),
       browseBannerAction: byId('browse-banner-action'),
       shareTitle: byId('share-title'),
+      upBtn: byId('up-btn'),
+      upBtnLabel: byId('up-btn-label'),
+      refreshBtn: byId('refresh-btn'),
       breadcrumbs: byId('breadcrumbs'),
       uploadBtn: byId('upload-btn'),
       fileInput: byId('file-input'),
@@ -793,6 +806,15 @@
       els.disconnectBtn.setAttribute('aria-label', t('disconnect') + ': ' + t('disconnectHint'));
       // 面包屑只有文件夹名时像输入框；用本地化的导航名称表明这是“当前位置”。
       els.breadcrumbs.setAttribute('aria-label', t('breadcrumbLabel'));
+      if (els.upBtnLabel) els.upBtnLabel.textContent = t('goUp');
+      if (els.upBtn) {
+        els.upBtn.setAttribute('title', t('goUpHint'));
+        els.upBtn.setAttribute('aria-label', t('goUp'));
+      }
+      if (els.refreshBtn) {
+        els.refreshBtn.setAttribute('title', t('refreshHint'));
+        els.refreshBtn.setAttribute('aria-label', t('refresh'));
+      }
       els.uploadBtn.textContent = t('selectFiles');
       els.uploadHint.textContent = t('dropHint');
       els.uploadsTitle.textContent = t('uploadsTitle');
@@ -1111,6 +1133,8 @@
       // 上一会话的“N 个文件 · 已提交 N”进入新会话，等于伪造了从未发生过的统计。
       setHidden(els.uploadSummary, true);
       els.uploadSummary.textContent = '';
+      if (els.upBtn) els.upBtn.disabled = true;
+      if (els.refreshBtn) els.refreshBtn.disabled = false;
       hideBanner();
       clearNode(els.entries);
       clearNode(els.breadcrumbs);
@@ -1518,6 +1542,7 @@
       els.listStatus.setAttribute('title', els.listStatus.textContent);
       setHidden(els.listFoot, !state.nextCursor);
       els.loadMore.disabled = state.loading;
+      if (els.refreshBtn) els.refreshBtn.disabled = state.loading;
 
       setHidden(els.listHead, els.listCount.textContent === '' && els.listStatus.textContent === '');
     }
@@ -1577,6 +1602,47 @@
     }
 
     /**
+     * 归一化面包屑名称：根节点的 `/` 或 `root` 属于协议占位符，展示时映射为本地化名称，
+     * 避免在标题或路径栏里出现孤立斜杠。
+     */
+    function crumbDisplayName(crumb) {
+      if (!crumb) return t('rootName');
+      var name = typeof crumb.name === 'string' ? crumb.name.trim() : '';
+      if (crumb.id === 'root') {
+        return name && name !== 'root' && name !== '/' ? name : t('rootName');
+      }
+      return name || crumb.id;
+    }
+
+    /**
+     * 仅基于已确认的面包屑返回上一级，避免按未落地的请求状态猜测父目录。
+     */
+    function goUp() {
+      if (!state.token || state.breadcrumbs.length < 2) return;
+      var parent = state.breadcrumbs[state.breadcrumbs.length - 2];
+      if (parent && parent.id) loadDir(parent.id, { reset: true });
+    }
+
+    /**
+     * 同步“上一级”按钮可用态与提示文案：处于根目录时保持禁用占位，
+     * 进出子目录时导航栏几何结构不跳动。
+     */
+    function updateUpButton(crumbs) {
+      if (!els.upBtn) return;
+      if (crumbs.length >= 2) {
+        var parentLabel = crumbDisplayName(crumbs[crumbs.length - 2]);
+        var hint = t('goUpTo', { name: parentLabel });
+        els.upBtn.disabled = false;
+        els.upBtn.setAttribute('title', hint);
+        els.upBtn.setAttribute('aria-label', hint);
+      } else {
+        els.upBtn.disabled = true;
+        els.upBtn.setAttribute('title', t('goUpHint'));
+        els.upBtn.setAttribute('aria-label', t('goUp'));
+      }
+    }
+
+    /**
      * 面包屑每次整体重建，保证当前目录与列表始终来自同一份已确认状态；根名称优先用服务端返回的共享目录名。
      */
     function renderBreadcrumbs() {
@@ -1596,10 +1662,12 @@
         crumbs.push({ id: 'root', name: t('rootName') });
       }
 
-      var rootName = crumbs.length && crumbs[0].name && crumbs[0].name !== 'root'
-        ? crumbs[0].name
+      var rawRoot = crumbs.length && typeof crumbs[0].name === 'string' ? crumbs[0].name.trim() : '';
+      var rootName = rawRoot && rawRoot !== 'root' && rawRoot !== '/'
+        ? rawRoot
         : t('shareTitle');
       els.shareTitle.textContent = rootName;
+      updateUpButton(crumbs);
 
       for (var i = 0; i < crumbs.length; i += 1) {
         var crumb = crumbs[i];
@@ -1614,7 +1682,7 @@
         wrap.className = 'crumb';
         var button = doc.createElement('button');
         button.type = 'button';
-        var label = crumb.name || (crumb.id === 'root' ? t('rootName') : crumb.id);
+        var label = crumbDisplayName(crumb);
         button.textContent = label;
         button.setAttribute('title', label);
         var isCurrent = i === crumbs.length - 1;
@@ -1688,11 +1756,20 @@
           nameButton.addEventListener('click', function () {
             loadDir(id, { reset: true });
           });
+          // 整行可点进入子目录，减少鼠标与触屏瞄准成本；点击行内按钮时不重复触发。
+          row.addEventListener('click', function (event) {
+            var target = event && event.target;
+            if (target) {
+              if (target.tagName === 'BUTTON') return;
+              if (typeof target.closest === 'function' && target.closest('button')) return;
+            }
+            loadDir(id, { reset: true });
+          });
         })(entry.id);
         nameWrap.appendChild(nameButton);
       } else {
         var nameLabel = doc.createElement('span');
-        nameLabel.className = 'entry-label';
+        nameLabel.className = 'entry-label is-file';
         nameLabel.textContent = entry.name;
         nameLabel.setAttribute('title', entry.name);
         nameWrap.appendChild(nameLabel);
@@ -2439,6 +2516,19 @@
         els.fileInput.click();
       });
 
+      if (els.upBtn) {
+        els.upBtn.addEventListener('click', function () {
+          goUp();
+        });
+      }
+
+      if (els.refreshBtn) {
+        els.refreshBtn.addEventListener('click', function () {
+          if (!state.token) return;
+          loadDir(state.dir, { reset: true });
+        });
+      }
+
       els.fileInput.addEventListener('change', function () {
         if (els.fileInput.files && els.fileInput.files.length) addFiles(els.fileInput.files);
         els.fileInput.value = '';
@@ -2524,6 +2614,12 @@
 
       doc.addEventListener('keydown', function (event) {
         if (event.key === 'Escape') setHidden(els.dropOverlay, true);
+        if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && event.key === 'ArrowUp') {
+          if (state.token && state.breadcrumbs.length >= 2) {
+            if (typeof event.preventDefault === 'function') event.preventDefault();
+            goUp();
+          }
+        }
       });
     }
 

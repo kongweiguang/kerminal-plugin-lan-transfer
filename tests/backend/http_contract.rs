@@ -1376,3 +1376,30 @@ async fn stopping_phase_rejects_session_and_download() {
     let (status, _, _) = fixture.send(fixture.get(&url)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
+
+/// 列表首项面包屑应返回共享目录的末级名称，且不得暴露父目录路径。
+#[tokio::test]
+async fn list_root_breadcrumb_exposes_leaf_name_without_parent_path() {
+    let fixture = Fixture::new();
+    let token = fixture.token().await;
+    let request = Request::builder()
+        .uri("/api/list?dir=root")
+        .header(header::HOST, fixture.bound.to_string())
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, body) = fixture.send(request).await;
+    assert_eq!(status, StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let first = &payload["breadcrumbs"][0];
+    assert_eq!(first["id"].as_str(), Some("root"));
+    assert_eq!(
+        first["name"].as_str(),
+        Some("share"),
+        "首项应返回共享目录末级名称而不是 /"
+    );
+    assert!(
+        !first["name"].as_str().unwrap().contains(['/', '\\']),
+        "根名称不得包含路径分隔符或上级路径"
+    );
+}
